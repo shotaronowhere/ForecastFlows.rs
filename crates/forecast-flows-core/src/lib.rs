@@ -18,12 +18,15 @@
     clippy::float_cmp
 )]
 
+pub mod edge;
 pub mod objective;
 pub mod solver;
 pub mod split_merge;
 pub mod tolerances;
 pub mod uni_v3;
 
+pub use edge::{Edge, EdgeError, SplitMergeEdge as SplitMergeEdgeHandle, UniV3Edge};
 pub use objective::{EndowmentLinear, Objective, ObjectiveError};
+pub use solver::{BoundedDualProblem, DualSolution, SolveError, SolverOptions};
 pub use split_merge::{SplitMerge, SplitMergeError};
 pub use uni_v3::{UniV3, UniV3Error};
