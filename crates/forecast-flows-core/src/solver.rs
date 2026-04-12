@@ -31,6 +31,7 @@
 
 use crate::edge::{Edge, EdgeError};
 use crate::objective::{EndowmentLinear, Objective};
+use crate::split_merge::SplitMerge;
 use lbfgsb_rs_pure::{LBFGSB, Solution, Status};
 use thiserror::Error;
 
@@ -234,11 +235,328 @@ fn seed_nu(lower: &[f64], upper: &[f64], _obj: &EndowmentLinear) -> Vec<f64> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Certification + primal recovery
+// ---------------------------------------------------------------------------
+
+/// Julia parity: `SolveCertificate` (see `src/solver.jl:323` / struct defined
+/// in `src/types.jl`). Captures the pass/fail verdict and the three residuals
+/// used by `certify_solution`.
+#[derive(Debug, Clone)]
+pub struct SolveCertificate {
+    pub passed: bool,
+    pub reason: String,
+    pub primal_value: f64,
+    pub dual_value: f64,
+    pub duality_gap: f64,
+    pub target_residual: f64,
+    pub bound_residual: f64,
+}
+
+/// Tolerance triple for [`certify`]. Defaults mirror Julia's
+/// `certify_solution` keyword defaults (`max(sqrt(eps), 1e-6)` / `1e-8`).
+#[derive(Debug, Clone, Copy)]
+pub struct CertifyTolerances {
+    pub gap_tol: f64,
+    pub target_tol: f64,
+    pub bound_tol: f64,
+}
+
+impl Default for CertifyTolerances {
+    fn default() -> Self {
+        let se = f64::EPSILON.sqrt();
+        Self {
+            gap_tol: se.max(1e-6),
+            target_tol: se.max(1e-6),
+            bound_tol: se.max(1e-8),
+        }
+    }
+}
+
+/// `max(0, lbᵢ - νᵢ, νᵢ - ubᵢ)` over all dual coords, matching Julia
+/// `_dual_bound_residual` (`src/solver.jl:280`).
+fn dual_bound_residual(obj: &EndowmentLinear, nu: &[f64]) -> f64 {
+    let lb = obj.lower_limit();
+    let ub = obj.upper_limit();
+    let mut resid = 0.0_f64;
+    for i in 0..nu.len() {
+        let lbf = lb[i].max(0.0);
+        resid = resid.max((lbf - nu[i]).max(0.0));
+        if ub[i].is_finite() {
+            resid = resid.max((nu[i] - ub[i]).max(0.0));
+        }
+    }
+    resid
+}
+
+/// Max split-merge consistency + bound violation across all split edges.
+/// Matches Julia `_splitmerge_bound_residual` (`src/solver.jl:304`).
+pub fn splitmerge_bound_residual(edges: &[Edge], edge_flows: &[Vec<f64>]) -> f64 {
+    let mut resid = 0.0_f64;
+    for (edge, x) in edges.iter().zip(edge_flows) {
+        let Edge::SplitMerge(sme) = edge else {
+            continue;
+        };
+        let sm = *sme.inner();
+        let n = x.len();
+        let w = if n == 1 {
+            -x[0]
+        } else {
+            let mut s = 0.0;
+            for v in &x[1..] {
+                s += *v;
+            }
+            s / (n - 1) as f64
+        };
+        resid = resid.max((w.abs() - sm.bound()).max(0.0));
+        resid = resid.max((x[0] + w).abs());
+        for j in 1..n {
+            resid = resid.max((x[j] - w).abs());
+        }
+    }
+    resid
+}
+
+/// Primal-recovery oracle for a single split/merge edge. Matches Julia
+/// `recover_splitmerge_flow!` (`src/prediction_markets.jl:249`).
+#[allow(clippy::too_many_arguments)]
+fn recover_splitmerge_flow(
+    sm: SplitMerge,
+    x: &mut [f64],
+    eta: &[f64],
+    residual: &[f64],
+    fixed: &[bool],
+    current_flow: &[f64],
+    lower_bounds: &[f64],
+    tol: f64,
+) -> f64 {
+    let gap = sm.gap(eta);
+    let gap_tol = tol * eta.len() as f64;
+    if gap > gap_tol {
+        sm.set_flow(x, sm.bound());
+        return sm.bound();
+    }
+    if gap < -gap_tol {
+        sm.set_flow(x, -sm.bound());
+        return -sm.bound();
+    }
+
+    let mut num = 0.0_f64;
+    let mut den = 0.0_f64;
+    for i in 0..residual.len() {
+        if !fixed[i] {
+            continue;
+        }
+        let d = if i == 0 { -1.0 } else { 1.0 };
+        num += d * residual[i];
+        den += 1.0;
+    }
+    if den == 0.0 {
+        num = -residual[0];
+        for r in &residual[1..] {
+            num += *r;
+        }
+        den = residual.len() as f64;
+    }
+
+    let b = sm.bound();
+    let mut wlo = -b;
+    let mut whi = b;
+    if lower_bounds[0].is_finite() {
+        whi = whi.min(current_flow[0] - lower_bounds[0]);
+    }
+    for i in 1..current_flow.len() {
+        if lower_bounds[i].is_finite() {
+            wlo = wlo.max(lower_bounds[i] - current_flow[i]);
+        }
+    }
+
+    let w = if wlo > whi {
+        // Contradictory bounds: prioritize the collateral budget, then
+        // satisfy as many outcome lower bounds as possible. Matches Julia's
+        // contradictory-bounds branch.
+        (num / den).clamp(-b, whi)
+    } else {
+        (num / den).clamp(wlo, whi)
+    };
+    sm.set_flow(x, w);
+    w
+}
+
+/// Julia parity: `recover_primal!` (`src/solver.jl:113`). Rewrites every
+/// split-merge edge's flow so the final netflow hits the objective's
+/// recovery targets on fixed coordinates. Returns `true` iff the problem
+/// actually contains any split-merge edges.
+pub fn recover_primal(problem: &BoundedDualProblem, solution: &mut DualSolution, tol: f64) -> bool {
+    let has_split = problem
+        .edges
+        .iter()
+        .any(|e| matches!(e, Edge::SplitMerge(_)));
+    if !has_split {
+        return false;
+    }
+
+    let Objective::EndowmentLinear(obj) = &problem.objective;
+    let n = problem.n_nodes;
+    let mut target = vec![0.0_f64; n];
+    let mut fixed = vec![false; n];
+    obj.recovery_targets(&mut target, &mut fixed, &solution.nu);
+    let lower_bounds = obj.primal_lower_bounds();
+
+    // Seed y with the netflow contribution from every non-split edge.
+    let mut y = vec![0.0_f64; n];
+    for (edge, x) in problem.edges.iter().zip(&solution.edge_flows) {
+        if matches!(edge, Edge::SplitMerge(_)) {
+            continue;
+        }
+        for (k, &node) in edge.nodes().iter().enumerate() {
+            y[node] += x[k];
+        }
+    }
+
+    for (i, edge) in problem.edges.iter().enumerate() {
+        let Edge::SplitMerge(sme) = edge else {
+            continue;
+        };
+        let sm = *sme.inner();
+        let nodes = sme.nodes().to_vec();
+        let deg = nodes.len();
+        let mut eta = vec![0.0_f64; deg];
+        let mut residual = vec![0.0_f64; deg];
+        let mut local_fixed = vec![false; deg];
+        let mut local_flow = vec![0.0_f64; deg];
+        let mut local_lb = vec![0.0_f64; deg];
+        for (k, &node) in nodes.iter().enumerate() {
+            eta[k] = solution.nu[node];
+            residual[k] = target[node] - y[node];
+            local_fixed[k] = fixed[node];
+            local_flow[k] = y[node];
+            local_lb[k] = lower_bounds[node];
+        }
+        recover_splitmerge_flow(
+            sm,
+            &mut solution.edge_flows[i],
+            &eta,
+            &residual,
+            &local_fixed,
+            &local_flow,
+            &local_lb,
+            tol,
+        );
+        for (k, &node) in nodes.iter().enumerate() {
+            y[node] += solution.edge_flows[i][k];
+        }
+    }
+
+    solution.netflow = y;
+    true
+}
+
+/// Julia parity: `certify_solution` (`src/solver.jl:323`). Recomputes
+/// `ŷ = Σᵢ scatter(xᵢ, Aᵢ)` from the per-edge flows, measures the
+/// consistency/target/bound residuals, and emits the verdict.
+pub fn certify(
+    problem: &BoundedDualProblem,
+    solution: &DualSolution,
+    tols: CertifyTolerances,
+) -> SolveCertificate {
+    let Objective::EndowmentLinear(obj) = &problem.objective;
+    let n = problem.n_nodes;
+
+    let mut yhat = vec![0.0_f64; n];
+    for (edge, x) in problem.edges.iter().zip(&solution.edge_flows) {
+        for (k, &node) in edge.nodes().iter().enumerate() {
+            yhat[node] += x[k];
+        }
+    }
+
+    let mut flow_residual = 0.0_f64;
+    for i in 0..n {
+        flow_residual = flow_residual.max((yhat[i] - solution.netflow[i]).abs());
+    }
+
+    let mut target = vec![0.0_f64; n];
+    let mut fixed = vec![false; n];
+    obj.recovery_targets(&mut target, &mut fixed, &solution.nu);
+
+    let mut target_residual = flow_residual;
+    for i in 0..n {
+        if fixed[i] {
+            target_residual = target_residual.max((yhat[i] - target[i]).abs());
+        }
+    }
+
+    let bound_residual = dual_bound_residual(obj, &solution.nu).max(splitmerge_bound_residual(
+        &problem.edges,
+        &solution.edge_flows,
+    ));
+
+    let primal_val = obj.primal_utility(&yhat);
+    let dual_val = {
+        let mut acc = obj.dual_utility(&solution.nu);
+        for (edge, x) in problem.edges.iter().zip(&solution.edge_flows) {
+            for (k, &node) in edge.nodes().iter().enumerate() {
+                acc += x[k] * solution.nu[node];
+            }
+        }
+        acc
+    };
+    let duality_gap = dual_val - primal_val;
+
+    let primal_finite = primal_val.is_finite();
+    let dual_finite = dual_val.is_finite();
+    let passed = primal_finite
+        && dual_finite
+        && target_residual <= tols.target_tol
+        && bound_residual <= tols.bound_tol
+        && duality_gap.abs() <= tols.gap_tol;
+
+    let mut reasons: Vec<String> = Vec::new();
+    if !primal_finite {
+        reasons.push("primal objective is not finite".into());
+    }
+    if !dual_finite {
+        reasons.push("dual objective is not finite".into());
+    }
+    if target_residual > tols.target_tol {
+        reasons.push(format!(
+            "target residual {target_residual} exceeds tolerance {}",
+            tols.target_tol
+        ));
+    }
+    if bound_residual > tols.bound_tol {
+        reasons.push(format!(
+            "bound residual {bound_residual} exceeds tolerance {}",
+            tols.bound_tol
+        ));
+    }
+    if duality_gap.abs() > tols.gap_tol {
+        reasons.push(format!(
+            "duality gap {duality_gap} exceeds tolerance {}",
+            tols.gap_tol
+        ));
+    }
+    if reasons.is_empty() {
+        reasons.push("certified".into());
+    }
+
+    SolveCertificate {
+        passed,
+        reason: reasons.join("; "),
+        primal_value: primal_val,
+        dual_value: dual_val,
+        duality_gap,
+        target_residual,
+        bound_residual,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edge::{Edge, UniV3Edge};
+    use crate::edge::{Edge, SplitMergeEdge, UniV3Edge};
     use crate::objective::{EndowmentLinear, Objective};
+    use crate::split_merge::SplitMerge;
     use crate::uni_v3::UniV3;
     use lbfgsb_rs_pure::{LBFGSB, Status};
 
@@ -340,5 +658,91 @@ mod tests {
         // Ūᶜ(ν ≈ c) = (ν − c)·h₀ ≈ 100·√eps · 2 ≈ 3e-6 (seed offset, not
         // a convergence error — the trade contribution is exactly zero).
         assert!(sol.dual_value.abs() < 1e-5);
+    }
+
+    // -- splitmerge_bound_residual / recover_primal / certify ------------
+
+    fn splitmerge_problem(mu: f64) -> BoundedDualProblem {
+        // 3 nodes: [collateral, outcome1, outcome2]. h0 = 0 so there is no
+        // endowment floor, keeping primal recovery degenerate but exercising
+        // the recovery-target branch on ν = c.
+        let obj = EndowmentLinear::new(vec![1.0, 0.5, 0.5], vec![0.0, 0.0, 0.0]).unwrap();
+        let sm = SplitMerge::new(3, 2.0, mu).unwrap();
+        let edge = Edge::SplitMerge(SplitMergeEdge::new(vec![0, 1, 2], sm).unwrap());
+        BoundedDualProblem::new(Objective::EndowmentLinear(obj), vec![edge], 3).unwrap()
+    }
+
+    #[test]
+    fn splitmerge_bound_residual_flags_oversized_flow() {
+        let problem = splitmerge_problem(0.0);
+        // w = 3 > B = 2 so |w| - B = 1.
+        let edge_flows = vec![vec![-3.0, 3.0, 3.0]];
+        let r = splitmerge_bound_residual(&problem.edges, &edge_flows);
+        assert!((r - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn splitmerge_bound_residual_zero_for_consistent_flow() {
+        let problem = splitmerge_problem(0.0);
+        let edge_flows = vec![vec![-1.5, 1.5, 1.5]];
+        let r = splitmerge_bound_residual(&problem.edges, &edge_flows);
+        assert!(r.abs() < 1e-15);
+    }
+
+    #[test]
+    fn recover_primal_is_noop_without_split_edges() {
+        let problem = trivial_univ3_problem();
+        let mut sol = problem.solve(SolverOptions::default()).unwrap();
+        let before = sol.edge_flows.clone();
+        let recovered = recover_primal(&problem, &mut sol, 1e-8);
+        assert!(!recovered);
+        assert_eq!(before, sol.edge_flows);
+    }
+
+    #[test]
+    fn recover_primal_snaps_to_bang_bang_mint_on_large_positive_gap() {
+        // Hand-built solution: ν clearly above c on the outcome sides so the
+        // split-merge gap is strongly positive, forcing the mint branch.
+        let problem = splitmerge_problem(0.0);
+        let mut sol = DualSolution {
+            nu: vec![1.0, 1.0, 1.0],
+            netflow: vec![0.0; 3],
+            edge_flows: vec![vec![0.0; 3]],
+            dual_value: 0.0,
+            iterations: 0,
+            status: Status::Converged,
+        };
+        let recovered = recover_primal(&problem, &mut sol, f64::EPSILON.sqrt());
+        assert!(recovered);
+        // gap = 1 + 1 - 1 = 1 > gap_tol → bang-bang mint at w = B = 2.
+        assert!((sol.edge_flows[0][0] + 2.0).abs() < 1e-12);
+        assert!((sol.edge_flows[0][1] - 2.0).abs() < 1e-12);
+        assert!((sol.edge_flows[0][2] - 2.0).abs() < 1e-12);
+        assert!((sol.netflow[0] + 2.0).abs() < 1e-12);
+        assert!((sol.netflow[1] - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn certify_trivial_problem_passes() {
+        let problem = trivial_univ3_problem();
+        let sol = problem.solve(SolverOptions::default()).unwrap();
+        let cert = certify(&problem, &sol, CertifyTolerances::default());
+        // With edge idle, flows are zero → all residuals zero, duality gap
+        // equals Ūᶜ(ν) - 0 ≈ 3e-6 which exceeds the default gap_tol of 1e-6.
+        // Loosen tolerances to certify.
+        let loose = CertifyTolerances {
+            gap_tol: 1e-4,
+            target_tol: 1e-6,
+            bound_tol: 1e-8,
+        };
+        let cert_loose = certify(&problem, &sol, loose);
+        assert!(
+            cert_loose.passed,
+            "loose cert failed: {}",
+            cert_loose.reason
+        );
+        // Default-tolerance cert should fail on the gap and say so.
+        assert!(!cert.passed);
+        assert!(cert.reason.contains("duality gap"));
     }
 }

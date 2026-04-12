@@ -15,7 +15,8 @@
     clippy::doc_markdown,
     clippy::comparison_chain,
     clippy::needless_range_loop,
-    clippy::float_cmp
+    clippy::float_cmp,
+    clippy::cast_precision_loss
 )]
 
 pub mod edge;
@@ -27,6 +28,9 @@ pub mod uni_v3;
 
 pub use edge::{Edge, EdgeError, SplitMergeEdge as SplitMergeEdgeHandle, UniV3Edge};
 pub use objective::{EndowmentLinear, Objective, ObjectiveError};
-pub use solver::{BoundedDualProblem, DualSolution, SolveError, SolverOptions};
+pub use solver::{
+    BoundedDualProblem, CertifyTolerances, DualSolution, SolveCertificate, SolveError,
+    SolverOptions, certify, recover_primal, splitmerge_bound_residual,
+};
 pub use split_merge::{SplitMerge, SplitMergeError};
 pub use uni_v3::{UniV3, UniV3Error};
