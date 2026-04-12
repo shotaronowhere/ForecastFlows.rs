@@ -5,3 +5,24 @@
 //! Moreau-Yosida smoothing, doubling + bisection on the split bound,
 //! certification, and primal recovery. No generic AD, no exact BFGS,
 //! no `Markowitz`, no `ConstantProduct`.
+//!
+//! Current session (Phase 3 narrowed slice): data-layer ports only — edges
+//! and the objective. The bounded dual solver and smoothing/certification
+//! pipeline land in Phase 5.
+
+#![allow(
+    clippy::missing_panics_doc,
+    clippy::doc_markdown,
+    clippy::comparison_chain,
+    clippy::needless_range_loop,
+    clippy::float_cmp
+)]
+
+pub mod objective;
+pub mod split_merge;
+pub mod tolerances;
+pub mod uni_v3;
+
+pub use objective::{EndowmentLinear, Objective, ObjectiveError};
+pub use split_merge::{SplitMerge, SplitMergeError};
+pub use uni_v3::{UniV3, UniV3Error};
