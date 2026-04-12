@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/forecast-flows-core",
+    "crates/forecast-flows-pm",
+    "crates/forecast-flows-worker",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.93"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shotaronowhere/ForecastFlows.rs"
+
+[workspace.dependencies]
+forecast-flows-core = { path = "crates/forecast-flows-core" }
+forecast-flows-pm = { path = "crates/forecast-flows-pm" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"

@@ -1,0 +1,15 @@
+[package]
+name = "forecast-flows-core"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Convex-flow solver core for ForecastFlows (bounded dual, Moreau-Yosida smoothing, certification)."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true

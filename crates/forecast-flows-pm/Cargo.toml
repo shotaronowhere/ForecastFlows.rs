@@ -1,0 +1,18 @@
+[package]
+name = "forecast-flows-pm"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Prediction-market facade and protocol v2 DTOs for ForecastFlows."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+forecast-flows-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
