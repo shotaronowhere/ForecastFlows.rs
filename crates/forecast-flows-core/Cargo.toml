@@ -12,4 +12,5 @@ publish = false
 workspace = true
 
 [dependencies]
+lbfgsb-rs-pure = "0.1"
 thiserror.workspace = true

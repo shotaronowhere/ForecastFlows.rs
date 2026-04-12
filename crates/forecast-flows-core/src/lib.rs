@@ -19,6 +19,7 @@
 )]
 
 pub mod objective;
+pub mod solver;
 pub mod split_merge;
 pub mod tolerances;
 pub mod uni_v3;
