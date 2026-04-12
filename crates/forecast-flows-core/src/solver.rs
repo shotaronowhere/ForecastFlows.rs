@@ -210,6 +210,24 @@ impl BoundedDualProblem {
             status,
         })
     }
+
+    /// Convenience wrapper that runs `solve` → `recover_primal` (no-op for
+    /// direct-only problems) → `certify`. Mirrors the `_finalize_solution!` +
+    /// `certify_solution` sequence at the tail of Julia's
+    /// `_solve_lbfgsb_once!` (`src/solver.jl:585`).
+    ///
+    /// `recovery_tol` follows Julia's default of `max(√eps, 10·pgtol)`.
+    pub fn solve_and_certify(
+        &self,
+        opts: SolverOptions,
+        tols: CertifyTolerances,
+    ) -> Result<(DualSolution, SolveCertificate), SolveError> {
+        let mut solution = self.solve(opts)?;
+        let recovery_tol = f64::EPSILON.sqrt().max(10.0 * opts.pgtol);
+        recover_primal(self, &mut solution, recovery_tol);
+        let cert = certify(self, &solution, tols);
+        Ok((solution, cert))
+    }
 }
 
 /// Compute `[lower, upper]` dual bounds with the same `max(0, lb)` floor
@@ -233,6 +251,21 @@ fn seed_nu(lower: &[f64], upper: &[f64], _obj: &EndowmentLinear) -> Vec<f64> {
             if ub.is_finite() { seed.min(ub) } else { seed }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Moreau-Yosida smoothing helper
+// ---------------------------------------------------------------------------
+
+/// Moreau-Yosida smoothing parameter `μ = gap_tol / (5·B²)`, which bounds the
+/// smoothing bias `μB²/2` by `gap_tol/10`. Matches Julia
+/// `_smoothing_parameter` (`src/prediction_market_api.jl:889`).
+///
+/// `B` is floored at `1.0` before squaring to guard the small-bound regime,
+/// matching `B_safe = max(B, one(T))` in Julia.
+pub fn moreau_yosida_mu(split_bound: f64, gap_tol: f64) -> f64 {
+    let b_safe = split_bound.max(1.0);
+    gap_tol / (5.0 * b_safe * b_safe)
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +753,49 @@ mod tests {
         assert!((sol.edge_flows[0][2] - 2.0).abs() < 1e-12);
         assert!((sol.netflow[0] + 2.0).abs() < 1e-12);
         assert!((sol.netflow[1] - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn moreau_yosida_mu_matches_julia_formula() {
+        let gap_tol = 5e-4;
+        let b = 4.0;
+        // μ = gap_tol / (5 · max(B,1)²) = 5e-4 / 80 = 6.25e-6
+        let mu = moreau_yosida_mu(b, gap_tol);
+        assert!((mu - 6.25e-6).abs() < 1e-18);
+        // B < 1 gets floored.
+        let mu_tiny = moreau_yosida_mu(0.1, gap_tol);
+        assert!((mu_tiny - gap_tol / 5.0).abs() < 1e-18);
+    }
+
+    #[test]
+    fn solve_and_certify_direct_only_two_outcome_problem() {
+        // 3 nodes: [collateral=0, outcome1=1, outcome2=2]. Two UniV3 edges,
+        // one per outcome, both γ = 1 at current_price = 1 so the no-trade
+        // cone `{1}` contains the ratio `ν_i/ν_j = 1` at the ν = c seed.
+        // Objective: c = [1, 1, 1], h₀ = [1, 1, 1] — identical to the
+        // single-UniV3 smoke test except with an extra outcome node.
+        let obj = EndowmentLinear::new(vec![1.0, 1.0, 1.0], vec![1.0, 1.0, 1.0]).unwrap();
+        let pool1 = UniV3::new(1.0, vec![2.0], vec![100.0], 1.0).unwrap();
+        let pool2 = UniV3::new(1.0, vec![2.0], vec![100.0], 1.0).unwrap();
+        let edges = vec![
+            Edge::UniV3(UniV3Edge::new([0, 1], pool1).unwrap()),
+            Edge::UniV3(UniV3Edge::new([0, 2], pool2).unwrap()),
+        ];
+        let problem = BoundedDualProblem::new(Objective::EndowmentLinear(obj), edges, 3).unwrap();
+        let loose = CertifyTolerances {
+            gap_tol: 1e-3,
+            target_tol: 1e-4,
+            bound_tol: 1e-4,
+        };
+        let (sol, cert) = problem
+            .solve_and_certify(SolverOptions::default(), loose)
+            .unwrap();
+        assert_eq!(sol.status, Status::Converged);
+        assert_eq!(sol.nu.len(), 3);
+        assert!(cert.passed, "cert should pass: {}", cert.reason);
+        // No split-merge edges → recover_primal is a no-op; netflow stays
+        // as the scatter of the per-edge optima.
+        assert_eq!(sol.edge_flows.len(), 2);
     }
 
     #[test]

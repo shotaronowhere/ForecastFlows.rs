@@ -30,7 +30,7 @@ pub use edge::{Edge, EdgeError, SplitMergeEdge as SplitMergeEdgeHandle, UniV3Edg
 pub use objective::{EndowmentLinear, Objective, ObjectiveError};
 pub use solver::{
     BoundedDualProblem, CertifyTolerances, DualSolution, SolveCertificate, SolveError,
-    SolverOptions, certify, recover_primal, splitmerge_bound_residual,
+    SolverOptions, certify, moreau_yosida_mu, recover_primal, splitmerge_bound_residual,
 };
 pub use split_merge::{SplitMerge, SplitMergeError};
 pub use uni_v3::{UniV3, UniV3Error};
