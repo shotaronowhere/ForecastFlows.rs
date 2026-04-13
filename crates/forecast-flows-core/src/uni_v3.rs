@@ -124,6 +124,25 @@ impl UniV3 {
         self.lower_ticks.len()
     }
 
+    /// Maximum extractable outcome reserve summed across all nonzero bands.
+    /// Mirrors Julia `_univ3_max_outcome_reserve` at
+    /// `prediction_market_api.jl:851` — for each band with `k > 0`,
+    /// `√(k·p_high) − √(k·p_low)` where `p_high = lower_ticks[i]` and
+    /// `p_low = lower_ticks[i+1]` (or `0` for the last band).
+    pub fn max_outcome_reserve(&self) -> f64 {
+        let mut total = 0.0;
+        for idx in 0..self.lower_ticks.len() {
+            let k = self.liquidity[idx];
+            if k == 0.0 {
+                continue;
+            }
+            let p_high = self.tick_high(idx);
+            let p_low = self.tick_low(idx);
+            total += (k * p_high).sqrt() - (k * p_low).sqrt();
+        }
+        total
+    }
+
     /// Closed-form dual arbitrage oracle. `eta` is the 2-vector `(ν₀, ν₁)` of
     /// shadow prices for `(collateral, outcome)`. Writes the optimal net flow
     /// into `x`. Matches Julia `find_arb!(x, cfmm::UniV3, η)`.

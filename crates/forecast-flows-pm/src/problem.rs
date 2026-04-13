@@ -235,8 +235,12 @@ impl UniV3MarketSpec {
     /// the band order, and special-case the terminal zero-liquidity band.
     fn build_internal_edge(&self) -> Result<UniV3, UniV3Error> {
         let internal_current_price = 1.0 / self.current_price;
-        let internal_lower_ticks: Vec<f64> =
-            self.bands.iter().rev().map(|b| 1.0 / b.lower_price).collect();
+        let internal_lower_ticks: Vec<f64> = self
+            .bands
+            .iter()
+            .rev()
+            .map(|b| 1.0 / b.lower_price)
+            .collect();
         let liq_k: Vec<f64> = self
             .bands
             .iter()
@@ -369,6 +373,30 @@ pub fn default_split_bound(problem: &PredictionMarketProblem) -> f64 {
     total.max(f64::EPSILON)
 }
 
+/// Analytical split-bound ceiling — the physical upper limit no flow can
+/// exceed for any single outcome (initial holding + total AMM outcome
+/// reserve across all markets that name it). Matches Julia
+/// `_analytical_split_bound` (`prediction_market_api.jl:870`). Used by
+/// `solve_with_doubling` to clamp `B *= 2`.
+pub fn analytical_split_bound(problem: &PredictionMarketProblem) -> f64 {
+    let mut caps: HashMap<&str, f64> = HashMap::with_capacity(problem.outcomes.len());
+    for outcome in &problem.outcomes {
+        caps.insert(outcome.outcome_id(), outcome.initial_holding);
+    }
+    for spec in &problem.markets {
+        let extra = spec
+            .build_internal_edge()
+            .map(|edge| edge.max_outcome_reserve())
+            .unwrap_or(0.0);
+        let cap = caps.entry(spec.outcome_id()).or_insert(0.0);
+        *cap += extra;
+    }
+    if caps.is_empty() {
+        return problem.collateral_balance.max(f64::EPSILON);
+    }
+    caps.values().copied().fold(f64::INFINITY, f64::min)
+}
+
 /// Build the `EndowmentLinear` objective `c = [1, fair_values...]`,
 /// `h₀ = [collateral, holdings...]`. Matches Julia
 /// `_prediction_market_objective`.
@@ -466,14 +494,8 @@ mod tests {
 
     #[test]
     fn univ3_spec_requires_positive_liquidity_band() {
-        let err = UniV3MarketSpec::new(
-            "m",
-            "a",
-            0.5,
-            vec![UniV3Band::new(1.0, 0.0).unwrap()],
-            1.0,
-        )
-        .unwrap_err();
+        let err = UniV3MarketSpec::new("m", "a", 0.5, vec![UniV3Band::new(1.0, 0.0).unwrap()], 1.0)
+            .unwrap_err();
         assert!(matches!(err, ProblemError::NoPositiveLiquidityBand));
     }
 
@@ -621,12 +643,9 @@ mod tests {
         let problem = PredictionMarketProblem::new(outcomes, 1.0, vec![market], None).unwrap();
         let obj = build_objective(&problem).unwrap();
         let edges = build_edges(&problem, Mode::DirectOnly, None, 0.0).unwrap();
-        let bdp = BoundedDualProblem::new(
-            Objective::EndowmentLinear(obj),
-            edges,
-            problem.n_nodes(),
-        )
-        .unwrap();
+        let bdp =
+            BoundedDualProblem::new(Objective::EndowmentLinear(obj), edges, problem.n_nodes())
+                .unwrap();
         // Loosen gap_tol past the LBFGS-B termination noise floor (the default
         // `max(√eps, 1e-6)` is tighter than pgtol-limited convergence permits
         // on this seed).

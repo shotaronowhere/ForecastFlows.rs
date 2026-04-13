@@ -14,18 +14,21 @@
     clippy::doc_markdown,
     clippy::float_cmp,
     clippy::collapsible_if,
-    clippy::match_wildcard_for_single_variants
+    clippy::match_wildcard_for_single_variants,
+    clippy::too_many_arguments
 )]
 
 pub mod problem;
 pub mod protocol;
+pub mod solve;
 
 pub use problem::{
     Mode, OutcomeSpec, PredictionMarketProblem, ProblemError, UniV3Band, UniV3MarketSpec,
-    build_edges, build_objective, default_split_bound,
+    analytical_split_bound, build_edges, build_objective, default_split_bound,
 };
 pub use protocol::{
     CertificateDto, CompareResponse, CompareResult, ErrorBody, ErrorResponse, HealthResponse,
     HealthResult, PROTOCOL_VERSION, SolveResponse, SolveResultDto, SplitMergePlanDto, TradeDto,
     finite_or_null, finite_or_null_vec,
 };
+pub use solve::{SolveError, SolveOptions, SolveOutcome, solve};
