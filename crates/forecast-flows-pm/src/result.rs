@@ -15,7 +15,8 @@ use crate::protocol::{
     CertificateDto, CompareResponse, CompareResult, PROTOCOL_VERSION, SolveResultDto,
     SplitMergePlanDto, TradeDto, finite_or_null, finite_or_null_vec,
 };
-use crate::solve::{SolveError, SolveOptions, SolveOutcome, solve};
+use crate::solve::{SolveError, SolveOptions, SolveOutcome, solve, solve_with_seed};
+use crate::workspace::PredictionMarketWorkspace;
 
 /// Tolerance for "edge is active" / non-zero trade reporting. Mirrors Julia's
 /// `max(1e-12, √eps)` default (`prediction_market_api.jl:1096`).
@@ -208,6 +209,64 @@ pub fn compare_prediction_market_families(
     );
 
     let mixed_outcome = solve(problem, mixed_opts)?;
+    let mixed_edges = crate::problem::build_edges(
+        problem,
+        Mode::MixedEnabled,
+        Some(mixed_outcome.split_bound),
+        0.0,
+    )
+    .map_err(SolveError::Problem)?;
+    let mixed_result = extract_solve_result(
+        problem,
+        &mixed_outcome,
+        Mode::MixedEnabled,
+        &mixed_edges,
+        None,
+    );
+
+    Ok(CompareResponse {
+        protocol_version: PROTOCOL_VERSION,
+        request_id,
+        ok: true,
+        command: "compare_prediction_market_families".to_string(),
+        result: CompareResult {
+            direct_only: direct_result,
+            mixed_enabled: mixed_result,
+        },
+    })
+}
+
+/// Workspace-aware compare. Mirrors Julia
+/// `compare_prediction_market_families!(workspace, problem; …)`. The workspace
+/// supplies the dual seed for the direct solve from `direct_seed` and the
+/// mixed solve also reads `direct_seed` (Julia
+/// `prediction_market_api.jl:1322`), then stores each solve's converged `ν`
+/// back into the matching slot.
+///
+/// Caller is responsible for ensuring the workspace layout matches `problem` —
+/// the worker uses `worker_compare_workspace` to enforce that.
+pub fn compare_prediction_market_families_with_workspace(
+    workspace: &mut PredictionMarketWorkspace,
+    problem: &PredictionMarketProblem,
+    request_id: Option<String>,
+    direct_opts: SolveOptions,
+    mixed_opts: SolveOptions,
+) -> Result<CompareResponse, SolveError> {
+    let direct_outcome = solve_with_seed(problem, direct_opts, workspace.direct_seed())?;
+    workspace.store_direct_seed(&direct_outcome.solution.nu);
+    let direct_edges = crate::problem::build_edges(problem, Mode::DirectOnly, None, 0.0)
+        .map_err(SolveError::Problem)?;
+    let direct_result = extract_solve_result(
+        problem,
+        &direct_outcome,
+        Mode::DirectOnly,
+        &direct_edges,
+        None,
+    );
+
+    // Julia line 1322: mixed reads `direct_seed`, not `mixed_seed`.
+    let mixed_outcome = solve_with_seed(problem, mixed_opts, workspace.direct_seed())?;
+    workspace.store_mixed_seed(&mixed_outcome.solution.nu);
     let mixed_edges = crate::problem::build_edges(
         problem,
         Mode::MixedEnabled,

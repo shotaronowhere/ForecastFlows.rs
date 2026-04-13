@@ -80,20 +80,36 @@ pub fn solve(
     problem: &PredictionMarketProblem,
     opts: SolveOptions,
 ) -> Result<SolveOutcome, SolveError> {
+    solve_with_seed(problem, opts, None)
+}
+
+/// `solve` variant that threads a caller-provided dual seed into the
+/// underlying `BoundedDualProblem`. For `Mode::MixedEnabled`, the seed is
+/// reused across the entire doubling loop's inner solves — Julia's
+/// `_solve_prediction_market_mixed` does the same with
+/// `ν_seed = _workspace_seed(workspace, :direct_only)` at line 1322
+/// (mixed reads the *direct* seed, not the mixed seed).
+pub fn solve_with_seed(
+    problem: &PredictionMarketProblem,
+    opts: SolveOptions,
+    nu_seed: Option<&[f64]>,
+) -> Result<SolveOutcome, SolveError> {
     match opts.mode {
-        Mode::DirectOnly => solve_direct_only(problem, opts),
-        Mode::MixedEnabled => solve_mixed_with_doubling(problem, opts),
+        Mode::DirectOnly => solve_direct_only(problem, opts, nu_seed),
+        Mode::MixedEnabled => solve_mixed_with_doubling(problem, opts, nu_seed),
     }
 }
 
 fn solve_direct_only(
     problem: &PredictionMarketProblem,
     opts: SolveOptions,
+    nu_seed: Option<&[f64]>,
 ) -> Result<SolveOutcome, SolveError> {
     let obj = build_objective(problem)?;
     let edges = build_edges(problem, Mode::DirectOnly, None, 0.0)?;
     let bdp = BoundedDualProblem::new(Objective::EndowmentLinear(obj), edges, problem.n_nodes())?;
-    let (solution, certificate) = bdp.solve_and_certify(opts.solver, derive_tols(&opts.solver))?;
+    let (solution, certificate) =
+        bdp.solve_and_certify_with_seed(opts.solver, derive_tols(&opts.solver), nu_seed)?;
     // Direct-only mode has no split/merge edge, so the "realized bound" is
     // meaningless — return 0.0 as a sentinel that callers can ignore.
     Ok(SolveOutcome {
@@ -106,6 +122,7 @@ fn solve_direct_only(
 fn solve_mixed_with_doubling(
     problem: &PredictionMarketProblem,
     opts: SolveOptions,
+    nu_seed: Option<&[f64]>,
 ) -> Result<SolveOutcome, SolveError> {
     let obj = build_objective(problem)?;
     let n_nodes = problem.n_nodes();
@@ -125,7 +142,7 @@ fn solve_mixed_with_doubling(
 
     for doubling in 0..=opts.max_doublings {
         let mu = moreau_yosida_mu(split_bound, gap_tol_for_mu);
-        let outcome = solve_at_bound(problem, &obj, n_nodes, split_bound, mu, opts)?;
+        let outcome = solve_at_bound(problem, &obj, n_nodes, split_bound, mu, opts, nu_seed)?;
 
         if !outcome.certificate.passed {
             if let Some(prior) = best.take() {
@@ -141,6 +158,7 @@ fn solve_mixed_with_doubling(
                     prior,
                     opts,
                     gap_tol_for_mu,
+                    nu_seed,
                 );
             }
             // No prior certified result yet — keep doubling.
@@ -197,12 +215,13 @@ fn bisect(
     initial_best: SolveOutcome,
     opts: SolveOptions,
     gap_tol_for_mu: f64,
+    nu_seed: Option<&[f64]>,
 ) -> Result<SolveOutcome, SolveError> {
     let mut best = initial_best;
     for _ in 0..4 {
         let mid = 0.5 * (lo + hi);
         let mu = moreau_yosida_mu(mid, gap_tol_for_mu);
-        let outcome = solve_at_bound(problem, obj, n_nodes, mid, mu, opts)?;
+        let outcome = solve_at_bound(problem, obj, n_nodes, mid, mu, opts, nu_seed)?;
         if outcome.certificate.passed {
             lo = mid;
             best = outcome;
@@ -223,10 +242,12 @@ fn solve_at_bound(
     split_bound: f64,
     mu: f64,
     opts: SolveOptions,
+    nu_seed: Option<&[f64]>,
 ) -> Result<SolveOutcome, SolveError> {
     let edges = build_edges(problem, Mode::MixedEnabled, Some(split_bound), mu)?;
     let bdp = BoundedDualProblem::new(Objective::EndowmentLinear(obj.clone()), edges, n_nodes)?;
-    let (solution, certificate) = bdp.solve_and_certify(opts.solver, derive_tols(&opts.solver))?;
+    let (solution, certificate) =
+        bdp.solve_and_certify_with_seed(opts.solver, derive_tols(&opts.solver), nu_seed)?;
     Ok(SolveOutcome {
         solution,
         certificate,

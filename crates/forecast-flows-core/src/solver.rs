@@ -166,12 +166,28 @@ impl BoundedDualProblem {
     }
 
     /// Solve the bounded dual with the provided options.
-    #[allow(clippy::too_many_lines)]
     pub fn solve(&self, opts: SolverOptions) -> Result<DualSolution, SolveError> {
+        self.solve_with_seed(opts, None)
+    }
+
+    /// Solve the bounded dual with a caller-provided dual seed. `nu0 = None`
+    /// recovers the cold-start behavior (Julia `_default_dual_seed_offset`).
+    /// When `nu0 = Some(seed)`, the seed is clamped into the `[lb, ub]` box
+    /// before being passed to L-BFGS-B, matching Julia's clamp in
+    /// `_initialize_lbfgsb_state!`.
+    #[allow(clippy::too_many_lines)]
+    pub fn solve_with_seed(
+        &self,
+        opts: SolverOptions,
+        nu0: Option<&[f64]>,
+    ) -> Result<DualSolution, SolveError> {
         let n = self.n_nodes;
         let Objective::EndowmentLinear(obj) = &self.objective;
         let (lower, upper) = dual_bounds(obj);
-        let nu = seed_nu(&lower, &upper, obj);
+        let nu = match nu0 {
+            Some(seed) if seed.len() == n => clamp_seed(seed, &lower, &upper),
+            _ => seed_nu(&lower, &upper, obj),
+        };
 
         // `LbfgsbProblem::build` takes ownership of the closure, so all
         // captures must be owned (no borrows of `self`). Clone the edge
@@ -306,7 +322,18 @@ impl BoundedDualProblem {
         opts: SolverOptions,
         tols: CertifyTolerances,
     ) -> Result<(DualSolution, SolveCertificate), SolveError> {
-        let mut solution = self.solve(opts)?;
+        self.solve_and_certify_with_seed(opts, tols, None)
+    }
+
+    /// `solve_and_certify` variant that threads an optional dual seed through
+    /// to `solve_with_seed` for workspace-cache warm starts.
+    pub fn solve_and_certify_with_seed(
+        &self,
+        opts: SolverOptions,
+        tols: CertifyTolerances,
+        nu0: Option<&[f64]>,
+    ) -> Result<(DualSolution, SolveCertificate), SolveError> {
+        let mut solution = self.solve_with_seed(opts, nu0)?;
         let recovery_tol = f64::EPSILON.sqrt().max(10.0 * opts.pgtol);
         recover_primal(self, &mut solution, recovery_tol);
         let cert = certify(self, &solution, tols);
@@ -351,6 +378,22 @@ fn dual_bounds(obj: &EndowmentLinear) -> (Vec<f64>, Vec<f64>) {
     let ub = obj.upper_limit();
     let lower: Vec<f64> = lb.iter().map(|&v| v.max(0.0)).collect();
     (lower, ub)
+}
+
+/// Clamp a caller-provided dual seed into `[lower, upper]` with the same
+/// `upper.is_finite()` guard `seed_nu` uses. Mirrors the clamp step in
+/// Julia's `_initialize_lbfgsb_state!` so a workspace-cached seed from a
+/// prior solve stays inside the current bound box even if the new problem
+/// tightens some bounds.
+fn clamp_seed(seed: &[f64], lower: &[f64], upper: &[f64]) -> Vec<f64> {
+    seed.iter()
+        .zip(lower)
+        .zip(upper)
+        .map(|((&s, &lb), &ub)| {
+            let c = s.max(lb);
+            if ub.is_finite() { c.min(ub) } else { c }
+        })
+        .collect()
 }
 
 /// Build the initial ν by applying Julia's `_default_dual_seed_offset`

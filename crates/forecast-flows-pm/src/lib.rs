@@ -24,6 +24,7 @@ pub mod request;
 pub mod result;
 pub mod solve;
 pub mod worker;
+pub mod workspace;
 
 pub use problem::{
     Mode, OutcomeSpec, PredictionMarketProblem, ProblemError, UniV3Band, UniV3MarketSpec,
@@ -35,6 +36,10 @@ pub use protocol::{
     finite_or_null, finite_or_null_vec,
 };
 pub use request::{ParsedRequest, RequestError, parse_protocol_request};
-pub use result::{compare_prediction_market_families, extract_solve_result};
-pub use solve::{SolveError, SolveOptions, SolveOutcome, solve};
-pub use worker::{PACKAGE_VERSION, handle_protocol_json};
+pub use result::{
+    compare_prediction_market_families, compare_prediction_market_families_with_workspace,
+    extract_solve_result,
+};
+pub use solve::{SolveError, SolveOptions, SolveOutcome, solve, solve_with_seed};
+pub use worker::{PACKAGE_VERSION, handle_protocol_json, handle_protocol_json_with_workspace_cache};
+pub use workspace::{Layout, PredictionMarketWorkspace, worker_compare_workspace};
