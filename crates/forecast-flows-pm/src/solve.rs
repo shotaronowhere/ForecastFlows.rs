@@ -27,10 +27,6 @@ pub enum SolveError {
     Problem(#[from] ProblemError),
     #[error(transparent)]
     Core(#[from] forecast_flows_core::SolveError),
-    #[error(
-        "split/merge bound remained near-active after {max_doublings} doublings (bound={bound})"
-    )]
-    DoublingExhausted { max_doublings: usize, bound: f64 },
     #[error("mixed solve never certified across {0} split_bound levels")]
     NeverCertified(usize),
 }
@@ -154,10 +150,16 @@ fn solve_mixed_with_doubling(
         best = Some(outcome);
 
         if doubling == opts.max_doublings {
-            return Err(SolveError::DoublingExhausted {
-                max_doublings: opts.max_doublings,
-                bound: split_bound,
-            });
+            // Mirror Julia: with `throw_on_fail=false` (the default v1
+            // behavior) we don't error on a near-active certified result;
+            // we downgrade the certificate and return the best result we
+            // have. The orchestration layer turns `passed=false` into
+            // `status: "uncertified"` in the wire DTO.
+            return Ok(downgrade_near_active(
+                best.expect("just stored"),
+                opts.max_doublings,
+                split_bound,
+            ));
         }
         let next = (split_bound * 2.0).min(b_max);
         if next <= split_bound {
@@ -218,6 +220,32 @@ fn solve_at_bound(
         certificate,
         split_bound,
     })
+}
+
+/// Mirror Julia `_mark_prediction_market_uncertified` +
+/// `_append_prediction_market_message`: append the near-active diagnostic to
+/// the existing certificate message, flip `passed` to false, and leave the
+/// numeric fields untouched. The orchestration layer translates
+/// `passed=false` into `status: "uncertified"`.
+fn downgrade_near_active(
+    mut outcome: SolveOutcome,
+    max_doublings: usize,
+    split_bound: f64,
+) -> SolveOutcome {
+    // `{split_bound:?}` formats a Float64 as "5.0" (Debug) rather than "5"
+    // (Display), so the message matches Julia's `$(split_bound)` interpolation
+    // exactly when `split_bound` is whole-valued.
+    let extra = format!(
+        "split/merge bound remained near-active after {max_doublings} doublings (bound={split_bound:?})"
+    );
+    let cert = &mut outcome.certificate;
+    cert.passed = false;
+    if cert.reason.is_empty() {
+        cert.reason = extra;
+    } else if !cert.reason.contains(&extra) {
+        cert.reason = format!("{}; {}", cert.reason, extra);
+    }
+    outcome
 }
 
 /// `max(mint, merge) = |w| = |x[0]|` for the trailing `Edge::SplitMerge` in
