@@ -9,8 +9,21 @@
 //! the parity fixture harness. Solver glue, workspace caching, problem
 //! validation, and orchestration land in Phase 6.
 
+#![allow(
+    clippy::missing_panics_doc,
+    clippy::doc_markdown,
+    clippy::float_cmp,
+    clippy::collapsible_if,
+    clippy::match_wildcard_for_single_variants
+)]
+
+pub mod problem;
 pub mod protocol;
 
+pub use problem::{
+    Mode, OutcomeSpec, PredictionMarketProblem, ProblemError, UniV3Band, UniV3MarketSpec,
+    build_edges, build_objective, default_split_bound,
+};
 pub use protocol::{
     CertificateDto, CompareResponse, CompareResult, ErrorBody, ErrorResponse, HealthResponse,
     HealthResult, PROTOCOL_VERSION, SolveResponse, SolveResultDto, SplitMergePlanDto, TradeDto,
