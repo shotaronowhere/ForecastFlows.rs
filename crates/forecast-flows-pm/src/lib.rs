@@ -20,6 +20,7 @@
 
 pub mod problem;
 pub mod protocol;
+pub mod result;
 pub mod solve;
 
 pub use problem::{
@@ -31,4 +32,5 @@ pub use protocol::{
     HealthResult, PROTOCOL_VERSION, SolveResponse, SolveResultDto, SplitMergePlanDto, TradeDto,
     finite_or_null, finite_or_null_vec,
 };
+pub use result::{compare_prediction_market_families, extract_solve_result};
 pub use solve::{SolveError, SolveOptions, SolveOutcome, solve};
