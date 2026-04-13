@@ -20,8 +20,10 @@
 
 pub mod problem;
 pub mod protocol;
+pub mod request;
 pub mod result;
 pub mod solve;
+pub mod worker;
 
 pub use problem::{
     Mode, OutcomeSpec, PredictionMarketProblem, ProblemError, UniV3Band, UniV3MarketSpec,
@@ -32,5 +34,7 @@ pub use protocol::{
     HealthResult, PROTOCOL_VERSION, SolveResponse, SolveResultDto, SplitMergePlanDto, TradeDto,
     finite_or_null, finite_or_null_vec,
 };
+pub use request::{ParsedRequest, RequestError, parse_protocol_request};
 pub use result::{compare_prediction_market_families, extract_solve_result};
 pub use solve::{SolveError, SolveOptions, SolveOutcome, solve};
+pub use worker::{PACKAGE_VERSION, handle_protocol_json};
