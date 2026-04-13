@@ -180,25 +180,9 @@ fn mixed_opts() -> SolveOptions {
         mode: Mode::MixedEnabled,
         max_doublings: 0,
         solver: fixture_solver(),
-        ..SolveOptions::default()
     }
 }
 
-// NOTE: the three solve/compare parity tests below currently FAIL because
-// `lbfgsb-rs-pure` hits a `LineSearchFailure` on the protocol fixture
-// problem — the UniV3 oracle has a non-smooth gradient at the no-trade cone
-// boundary (γ=1.0 collapses the cone to a single price), and the pure-Rust
-// L-BFGS-B port appears stricter than Julia's about the kink. This is a
-// genuine Phase 5 stop-rule trigger ("If `lbfgsb-rs-pure` fails parity or
-// causes unacceptable behavior, stop and revise the plan") rather than a
-// fixture or test bug — the Julia side runs the exact same problem to
-// completion and produces the committed JSON. The tests are kept
-// `#[ignore]`-tagged here as executable documentation of what parity is
-// supposed to look like; they should be re-enabled after the L-BFGS-B
-// integration is fixed (either with a kink-safe seed perturbation, a
-// smoothed γ, or an alternative L-BFGS-B port).
-
-#[ignore = "blocked on lbfgsb-rs-pure LineSearchFailure at UniV3 no-trade cone (Phase 5 stop-rule)"]
 #[test]
 fn solve_direct_matches_fixture() {
     let expected = load_fixture("solve_direct");
@@ -218,7 +202,6 @@ fn solve_direct_matches_fixture() {
     assert_json_subset(&actual, &expected, "$");
 }
 
-#[ignore = "blocked on lbfgsb-rs-pure LineSearchFailure at UniV3 no-trade cone (Phase 5 stop-rule)"]
 #[test]
 fn solve_mixed_matches_fixture() {
     let expected = load_fixture("solve_mixed");
@@ -243,7 +226,6 @@ fn solve_mixed_matches_fixture() {
     assert_json_subset(&actual, &expected, "$");
 }
 
-#[ignore = "blocked on lbfgsb-rs-pure LineSearchFailure at UniV3 no-trade cone (Phase 5 stop-rule)"]
 #[test]
 fn compare_matches_fixture() {
     let expected = load_fixture("compare");

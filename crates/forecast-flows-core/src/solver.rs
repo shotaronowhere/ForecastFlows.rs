@@ -32,8 +32,20 @@
 use crate::edge::{Edge, EdgeError};
 use crate::objective::{EndowmentLinear, Objective};
 use crate::split_merge::SplitMerge;
-use lbfgsb_rs_pure::{LBFGSB, Solution, Status};
+use lbfgsb::{LbfgsbParameter, LbfgsbProblem, LbfgsbState};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Mutex;
 use thiserror::Error;
+
+/// The `lbfgsb` 0.1 crate wraps Becker's C port, which is not thread-safe —
+/// internal Fortran COMMON blocks make concurrent `state.minimize()` calls
+/// race and produce `NeverCertified` failures only when `cargo test` runs
+/// multiple solver tests in parallel. Serialize all minimize entries through
+/// this global mutex until upstream is patched (or until we swap to a
+/// re-entrant port). Holding it across `minimize()` is acceptable because the
+/// solve is the dominant cost in every test that touches it.
+static LBFGSB_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Error)]
 pub enum SolveError {
@@ -46,7 +58,26 @@ pub enum SolveError {
         source: EdgeError,
     },
     #[error("L-BFGS-B driver failed: {0}")]
-    Driver(&'static str),
+    Driver(String),
+}
+
+/// Why the L-BFGS-B driver returned. The wrapped `lbfgsb` crate (a faithful
+/// Rust wrapper around Stephen Becker's C port of the Nocedal/Morales
+/// reference Fortran) terminates internally on convergence, abnormal line
+/// search, or internal error, and surfaces that reason only through private
+/// `task`/`csave` buffers. We surface the two states we can distinguish
+/// externally:
+///
+/// - `Terminated`: the driver returned normally (`state.minimize()` returned
+///   `Ok`). Caller should use [`SolveCertificate`] to decide whether the
+///   final point is actually optimal — a line-search failure inside C still
+///   lands here, same as true convergence.
+/// - `MaxIter`: the caller's function-evaluation budget (`max_iter`) was
+///   exhausted via the internal closure-abort path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SolveStatus {
+    Terminated,
+    MaxIter,
 }
 
 /// Tunable solver options. Defaults mirror Julia `_solve_lbfgsb_once!`.
@@ -55,6 +86,14 @@ pub struct SolverOptions {
     pub memory: usize,
     pub max_iter: usize,
     pub pgtol: f64,
+    /// L-BFGS-B function-value stopping ratio `factr·epsmch`. Julia
+    /// (`src/solver.jl:499`) defaults to `factr=1e1` — MUCH tighter than the
+    /// `lbfgsb` crate's own `1e7` default. Leaving it at the crate default
+    /// causes Rust to terminate at ~2e-9 function-value precision while
+    /// Julia runs to ~2e-15, which on UniV3 problems with `γ = 1` leaves a
+    /// ~1e-7 "near-kink" residual flow in Rust that Julia's tighter solve
+    /// converges away.
+    pub factr: f64,
     pub verbose: bool,
 }
 
@@ -64,6 +103,7 @@ impl Default for SolverOptions {
             memory: 5,
             max_iter: 10_000,
             pgtol: 1e-5,
+            factr: 1e1,
             verbose: false,
         }
     }
@@ -86,8 +126,12 @@ pub struct DualSolution {
     pub netflow: Vec<f64>,
     pub edge_flows: Vec<Vec<f64>>,
     pub dual_value: f64,
+    /// Number of function-and-gradient evaluations performed during the
+    /// solve. L-BFGS-B evaluates the oracle multiple times per outer
+    /// iteration (line search probes), so this is larger than Julia's
+    /// `isave(30)` iteration count; kept as a diagnostic, not load-bearing.
     pub iterations: usize,
-    pub status: Status,
+    pub status: SolveStatus,
 }
 
 impl BoundedDualProblem {
@@ -122,23 +166,39 @@ impl BoundedDualProblem {
     }
 
     /// Solve the bounded dual with the provided options.
+    #[allow(clippy::too_many_lines)]
     pub fn solve(&self, opts: SolverOptions) -> Result<DualSolution, SolveError> {
         let n = self.n_nodes;
         let Objective::EndowmentLinear(obj) = &self.objective;
         let (lower, upper) = dual_bounds(obj);
-        let mut nu = seed_nu(&lower, &upper, obj);
+        let nu = seed_nu(&lower, &upper, obj);
 
-        // Persistent edge-flow buffers + scratch gradient storage, reused
-        // across every callback evaluation to match Julia's in-place
-        // `find_arb!` hot path.
-        let mut edge_flows: Vec<Vec<f64>> =
+        // `LbfgsbProblem::build` takes ownership of the closure, so all
+        // captures must be owned (no borrows of `self`). Clone the edge
+        // list + objective once into the closure — both types are `Clone`
+        // and typically small (one `Edge::UniV3` per market plus an
+        // optional trailing `Edge::SplitMerge`). Iteration count lives in
+        // an `Rc<RefCell<…>>` so the outer scope can read it back after
+        // `state.minimize` returns.
+        let iter_count: Rc<RefCell<usize>> = Rc::new(RefCell::new(0usize));
+        let iter_count_inner = Rc::clone(&iter_count);
+        let edges_owned: Vec<Edge> = self.edges.clone();
+        let obj_clone = obj.clone();
+        let max_iter = opts.max_iter;
+        let n_edges = self.edges.len();
+        let mut edge_flows_inner: Vec<Vec<f64>> =
             self.edges.iter().map(|e| vec![0.0; e.degree()]).collect();
-        let mut obj_grad = vec![0.0_f64; n];
 
-        let edges = &self.edges;
-        let mut f_and_grad = |mu: &[f64]| -> (f64, Vec<f64>) {
-            // Gather per-edge η, run the closed-form oracle, write xᵢ*.
-            for (edge, x) in edges.iter().zip(edge_flows.iter_mut()) {
+        let eval_fn = move |mu: &[f64], g_out: &mut [f64]| -> anyhow::Result<f64> {
+            {
+                let mut count = iter_count_inner.borrow_mut();
+                if *count >= max_iter {
+                    return Err(anyhow::anyhow!("max_iter {max_iter} exceeded"));
+                }
+                *count += 1;
+            }
+
+            for (edge, x) in edges_owned.iter().zip(edge_flows_inner.iter_mut()) {
                 let mut eta_buf = [0.0_f64; 16];
                 let deg = edge.degree();
                 if deg <= eta_buf.len() {
@@ -152,48 +212,72 @@ impl BoundedDualProblem {
                 }
             }
 
-            // f = Ūᶜ(ν) + Σᵢ ⟨xᵢ, ν[Aᵢ]⟩
-            let mut f = obj.dual_utility(mu);
-            for (edge, x) in edges.iter().zip(edge_flows.iter()) {
+            let mut f = obj_clone.dual_utility(mu);
+            for (edge, x) in edges_owned.iter().zip(edge_flows_inner.iter()) {
                 for (k, &node) in edge.nodes().iter().enumerate() {
                     f += x[k] * mu[node];
                 }
             }
 
-            // ∇f = h₀ + Σᵢ scatter(xᵢ, Aᵢ). Allocate a fresh Vec because
-            // the lbfgsb-rs-pure callback signature takes the gradient by
-            // value; we still reuse `obj_grad` as a scratch buffer for
-            // the objective gradient before copying into the return vec.
-            obj.dual_gradient_into(&mut obj_grad, mu);
-            let mut g = obj_grad.clone();
-            for (edge, x) in edges.iter().zip(edge_flows.iter()) {
+            obj_clone.dual_gradient_into(g_out, mu);
+            for (edge, x) in edges_owned.iter().zip(edge_flows_inner.iter()) {
                 for (k, &node) in edge.nodes().iter().enumerate() {
-                    g[node] += x[k];
+                    g_out[node] += x[k];
                 }
             }
 
-            (f, g)
+            Ok(f)
         };
 
-        let mut driver = LBFGSB::new(opts.memory)
-            .with_max_iter(opts.max_iter)
-            .with_pgtol(opts.pgtol)
-            .with_verbose(opts.verbose);
-        let Solution {
-            x: nu_out,
-            f,
-            iterations,
-            status,
-        } = driver
-            .minimize(&mut nu, &lower, &upper, &mut f_and_grad)
-            .map_err(SolveError::Driver)?;
+        let mut problem = LbfgsbProblem::build(nu, eval_fn);
+        let bounds_iter =
+            lower
+                .iter()
+                .zip(upper.iter())
+                .map(|(&l, &u)| -> (Option<f64>, Option<f64>) {
+                    (Some(l), if u.is_finite() { Some(u) } else { None })
+                });
+        problem.set_bounds(bounds_iter);
 
-        // Recompute xᵢ at the final ν so `edge_flows` is authoritative on
-        // exit, then assemble the netflow y = Σᵢ scatter(xᵢ, Aᵢ).
+        let param = LbfgsbParameter {
+            m: opts.memory,
+            factr: opts.factr,
+            pgtol: opts.pgtol,
+            iprint: if opts.verbose { 99 } else { -1 },
+        };
+        let mut state = LbfgsbState::new(problem, param);
+        let min_result = {
+            let _guard = LBFGSB_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.minimize()
+        };
+        let status = if min_result.is_err() {
+            SolveStatus::MaxIter
+        } else {
+            SolveStatus::Terminated
+        };
+
+        let nu_out = state.x().to_vec();
+        let f = state.fx();
+        let iterations = *iter_count.borrow();
+
+        // Drop the LbfgsbState (and its closure+captures) before recomputing
+        // edge_flows at the final ν — the closure's edge_flows was consumed,
+        // so we allocate a fresh one for the authoritative post-solve
+        // snapshot.
+        drop(state);
+        let mut edge_flows: Vec<Vec<f64>> = Vec::with_capacity(n_edges);
+        for edge in &self.edges {
+            edge_flows.push(vec![0.0; edge.degree()]);
+        }
         for (edge, x) in self.edges.iter().zip(edge_flows.iter_mut()) {
             let eta: Vec<f64> = edge.nodes().iter().map(|&i| nu_out[i]).collect();
             edge.find_arb(x, &eta);
         }
+
+        cleanup_near_zero_flows(&self.edges, &mut edge_flows, &nu_out);
+
         let mut netflow = vec![0.0_f64; n];
         for (edge, x) in self.edges.iter().zip(edge_flows.iter()) {
             for (k, &node) in edge.nodes().iter().enumerate() {
@@ -232,6 +316,36 @@ impl BoundedDualProblem {
 
 /// Compute `[lower, upper]` dual bounds with the same `max(0, lb)` floor
 /// Julia applies in `_lbfgsb_bounds` (line 433).
+/// Julia parity: `cleanup_near_zero_flows!` (`src/solver.jl:102`). For every
+/// edge whose flow norm is below `flow_tol` AND whose execution value
+/// `⟨ν, x⟩` is below `atol`, zero the flow out. Julia's Fortran L-BFGS-B
+/// converges ~20x tighter than the C port we link here, so without this
+/// cleanup Rust leaves ~1e-7 "near kink" residuals on UniV3 edges sitting at
+/// the no-trade cone (γ=1 collapses the cone to a single exact ratio that
+/// f64 can't hit). Those residuals would otherwise leak into `extract_trades`
+/// as spurious extra trades vs. the Julia fixture.
+fn cleanup_near_zero_flows(edges: &[Edge], edge_flows: &mut [Vec<f64>], nu: &[f64]) {
+    let atol = f64::EPSILON.sqrt();
+    let flow_tol = atol.sqrt().max(10.0 * f64::EPSILON.sqrt());
+    for (edge, x) in edges.iter().zip(edge_flows.iter_mut()) {
+        let norm: f64 = x.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if norm > flow_tol {
+            continue;
+        }
+        let exec: f64 = edge
+            .nodes()
+            .iter()
+            .zip(x.iter())
+            .map(|(&node, &xi)| nu[node] * xi)
+            .sum();
+        if exec.abs() <= atol {
+            for slot in x.iter_mut() {
+                *slot = 0.0;
+            }
+        }
+    }
+}
+
 fn dual_bounds(obj: &EndowmentLinear) -> (Vec<f64>, Vec<f64>) {
     let lb = obj.lower_limit();
     let ub = obj.upper_limit();
@@ -302,6 +416,24 @@ impl Default for CertifyTolerances {
             gap_tol: se.max(1e-6),
             target_tol: se.max(1e-6),
             bound_tol: se.max(1e-8),
+        }
+    }
+}
+
+impl CertifyTolerances {
+    /// Julia parity: `_solve_certificate_tolerances(T, pgtol)` at
+    /// `src/solver.jl:423`. The Julia orchestration derives the certify
+    /// tolerances from the caller's `pgtol` at every entry point (both
+    /// `_solve_prediction_market_once` and `_solve_prediction_market_mixed`),
+    /// so tightening `pgtol` also tightens the certificate instead of leaving
+    /// the certificate stuck at its coarse default.
+    #[must_use]
+    pub fn from_pgtol(pgtol: f64) -> Self {
+        let se = f64::EPSILON.sqrt();
+        Self {
+            gap_tol: (500.0 * se).max(500.0 * pgtol),
+            target_tol: (100.0 * se).max(500.0 * pgtol),
+            bound_tol: (100.0 * se).max(100.0 * pgtol),
         }
     }
 }
@@ -591,50 +723,47 @@ mod tests {
     use crate::objective::{EndowmentLinear, Objective};
     use crate::split_merge::SplitMerge;
     use crate::uni_v3::UniV3;
-    use lbfgsb_rs_pure::{LBFGSB, Status};
 
-    // -- lbfgsb-rs-pure dependency smoke tests ----------------------------
+    // -- lbfgsb driver smoke tests ----------------------------------------
+    //
+    // Thin sanity checks over the upstream `lbfgsb` crate so a regression
+    // in the underlying C driver shows up here, not buried inside a
+    // BoundedDualProblem integration failure. These mirror the earlier
+    // `lbfgsb-rs-pure` smoke tests but use the `LbfgsbProblem`/`LbfgsbState`
+    // API of Stephen Becker's C port.
 
     #[test]
     fn lbfgsb_minimizes_scalar_quadratic_inside_bounds() {
-        let mut x = vec![0.0_f64];
-        let lower = vec![-1.0_f64];
-        let upper = vec![1.0_f64];
-        let mut solver = LBFGSB::new(5);
-        let mut f_and_grad = |xv: &[f64]| {
+        let f_and_grad = |xv: &[f64], g: &mut [f64]| -> anyhow::Result<f64> {
             let d = xv[0] - 0.5;
-            (d * d, vec![2.0 * d])
+            g[0] = 2.0 * d;
+            Ok(d * d)
         };
-        let sol = solver
-            .minimize(&mut x, &lower, &upper, &mut f_and_grad)
-            .expect("lbfgsb sanity minimize should succeed");
-        assert_eq!(sol.status, Status::Converged);
-        assert!(
-            (sol.x[0] - 0.5).abs() < 1e-6,
-            "expected x ≈ 0.5, got {}",
-            sol.x[0]
-        );
-        assert!(sol.f < 1e-10, "expected f ≈ 0, got {}", sol.f);
+        let mut problem = LbfgsbProblem::build(vec![0.0_f64], f_and_grad);
+        problem.set_bounds(std::iter::once((Some(-1.0_f64), Some(1.0_f64))));
+        let mut state = LbfgsbState::new(problem, LbfgsbParameter::default());
+        state.minimize().expect("scalar quadratic minimize");
+        let x = state.x();
+        assert!((x[0] - 0.5).abs() < 1e-6, "expected x ≈ 0.5, got {}", x[0]);
+        assert!(state.fx() < 1e-10, "expected f ≈ 0, got {}", state.fx());
     }
 
     #[test]
     fn lbfgsb_respects_active_upper_bound() {
-        let mut x = vec![0.0_f64];
-        let lower = vec![-1.0_f64];
-        let upper = vec![1.0_f64];
-        let mut solver = LBFGSB::new(5);
-        let mut f_and_grad = |xv: &[f64]| {
+        let f_and_grad = |xv: &[f64], g: &mut [f64]| -> anyhow::Result<f64> {
             let d = xv[0] - 2.0;
-            (d * d, vec![2.0 * d])
+            g[0] = 2.0 * d;
+            Ok(d * d)
         };
-        let sol = solver
-            .minimize(&mut x, &lower, &upper, &mut f_and_grad)
-            .expect("lbfgsb bounded minimize should succeed");
-        assert_eq!(sol.status, Status::Converged);
+        let mut problem = LbfgsbProblem::build(vec![0.0_f64], f_and_grad);
+        problem.set_bounds(std::iter::once((Some(-1.0_f64), Some(1.0_f64))));
+        let mut state = LbfgsbState::new(problem, LbfgsbParameter::default());
+        state.minimize().expect("bounded minimize");
+        let x = state.x();
         assert!(
-            (sol.x[0] - 1.0).abs() < 1e-6,
+            (x[0] - 1.0).abs() < 1e-6,
             "expected x pinned to upper bound 1.0, got {}",
-            sol.x[0]
+            x[0]
         );
     }
 
@@ -677,7 +806,7 @@ mod tests {
     fn bounded_dual_trivially_converges_on_no_trade_seed() {
         let problem = trivial_univ3_problem();
         let sol = problem.solve(SolverOptions::default()).unwrap();
-        assert_eq!(sol.status, Status::Converged);
+        assert_eq!(sol.status, SolveStatus::Terminated);
         assert_eq!(sol.nu.len(), 2);
         // ν stays near the seed (c + 100·√eps, clamped).
         assert!((sol.nu[0] - 1.0).abs() < 1e-4);
@@ -743,7 +872,7 @@ mod tests {
             edge_flows: vec![vec![0.0; 3]],
             dual_value: 0.0,
             iterations: 0,
-            status: Status::Converged,
+            status: SolveStatus::Terminated,
         };
         let recovered = recover_primal(&problem, &mut sol, f64::EPSILON.sqrt());
         assert!(recovered);
@@ -790,7 +919,7 @@ mod tests {
         let (sol, cert) = problem
             .solve_and_certify(SolverOptions::default(), loose)
             .unwrap();
-        assert_eq!(sol.status, Status::Converged);
+        assert_eq!(sol.status, SolveStatus::Terminated);
         assert_eq!(sol.nu.len(), 3);
         assert!(cert.passed, "cert should pass: {}", cert.reason);
         // No split-merge edges → recover_primal is a no-op; netflow stays

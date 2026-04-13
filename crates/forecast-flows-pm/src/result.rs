@@ -239,16 +239,6 @@ pub fn compare_prediction_market_families(
 mod tests {
     use super::*;
     use crate::problem::{OutcomeSpec, UniV3Band, UniV3MarketSpec};
-    use forecast_flows_core::CertifyTolerances;
-
-    fn slack_tols() -> CertifyTolerances {
-        CertifyTolerances {
-            gap_tol: 1e-4,
-            target_tol: 1e-4,
-            bound_tol: 1e-6,
-        }
-    }
-
     fn problem_no_trade() -> PredictionMarketProblem {
         let outcomes = vec![
             OutcomeSpec::new("a", 0.5, 0.0).unwrap(),
@@ -273,7 +263,6 @@ mod tests {
         let problem = problem_no_trade();
         let direct_opts = SolveOptions {
             mode: Mode::DirectOnly,
-            tolerances: slack_tols(),
             ..Default::default()
         };
         let outcome = solve(&problem, direct_opts).unwrap();
@@ -306,17 +295,13 @@ mod tests {
     #[test]
     fn compare_runs_both_modes_no_trade() {
         let problem = problem_no_trade();
-        let opts = SolveOptions {
-            tolerances: slack_tols(),
-            ..Default::default()
-        };
         let direct_opts = SolveOptions {
             mode: Mode::DirectOnly,
-            ..opts
+            ..Default::default()
         };
         let mixed_opts = SolveOptions {
             mode: Mode::MixedEnabled,
-            ..opts
+            ..Default::default()
         };
         let resp = compare_prediction_market_families(
             &problem,

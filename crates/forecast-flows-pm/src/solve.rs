@@ -15,6 +15,20 @@ use forecast_flows_core::{
     BoundedDualProblem, CertifyTolerances, DualSolution, Objective, SolveCertificate,
     SolverOptions, moreau_yosida_mu,
 };
+// CertifyTolerances stays in the import list because `derive_tols` still
+// returns it; the explicit `opts.tolerances` field was removed so every
+// entry point derives tolerances from `pgtol` the way Julia does.
+
+/// Julia parity: `_solve_prediction_market_once` and
+/// `_solve_prediction_market_mixed` both derive the certify tolerances from
+/// `pgtol` at the top of the solve, not from a caller-provided knob. Mirror
+/// that here so tightening `pgtol` in the test fixtures also tightens the
+/// certificate — the fixed `CertifyTolerances::default()` floor was masking
+/// the parity fixtures by rejecting sub-1e-6 residuals that Julia accepts.
+#[inline]
+fn derive_tols(solver: &SolverOptions) -> CertifyTolerances {
+    CertifyTolerances::from_pgtol(solver.pgtol)
+}
 
 use crate::problem::{
     Mode, PredictionMarketProblem, ProblemError, analytical_split_bound, build_edges,
@@ -38,7 +52,6 @@ pub struct SolveOptions {
     pub mode: Mode,
     pub max_doublings: usize,
     pub solver: SolverOptions,
-    pub tolerances: CertifyTolerances,
 }
 
 impl Default for SolveOptions {
@@ -47,7 +60,6 @@ impl Default for SolveOptions {
             mode: Mode::DirectOnly,
             max_doublings: 6,
             solver: SolverOptions::default(),
-            tolerances: CertifyTolerances::default(),
         }
     }
 }
@@ -81,7 +93,7 @@ fn solve_direct_only(
     let obj = build_objective(problem)?;
     let edges = build_edges(problem, Mode::DirectOnly, None, 0.0)?;
     let bdp = BoundedDualProblem::new(Objective::EndowmentLinear(obj), edges, problem.n_nodes())?;
-    let (solution, certificate) = bdp.solve_and_certify(opts.solver, opts.tolerances)?;
+    let (solution, certificate) = bdp.solve_and_certify(opts.solver, derive_tols(&opts.solver))?;
     // Direct-only mode has no split/merge edge, so the "realized bound" is
     // meaningless — return 0.0 as a sentinel that callers can ignore.
     Ok(SolveOutcome {
@@ -214,7 +226,7 @@ fn solve_at_bound(
 ) -> Result<SolveOutcome, SolveError> {
     let edges = build_edges(problem, Mode::MixedEnabled, Some(split_bound), mu)?;
     let bdp = BoundedDualProblem::new(Objective::EndowmentLinear(obj.clone()), edges, n_nodes)?;
-    let (solution, certificate) = bdp.solve_and_certify(opts.solver, opts.tolerances)?;
+    let (solution, certificate) = bdp.solve_and_certify(opts.solver, derive_tols(&opts.solver))?;
     Ok(SolveOutcome {
         solution,
         certificate,
@@ -272,17 +284,6 @@ mod tests {
     use super::*;
     use crate::problem::{OutcomeSpec, UniV3Band, UniV3MarketSpec};
 
-    fn slack_tols() -> CertifyTolerances {
-        // Same rationale as `pm/src/problem.rs::round_trip_into_bounded_dual_problem_certifies`:
-        // pgtol = 1e-5 leaves a residual gap floor of ~1e-6 at the no-trade
-        // seed, which is tighter than the default `max(√eps, 1e-6)` permits.
-        CertifyTolerances {
-            gap_tol: 1e-4,
-            target_tol: 1e-4,
-            bound_tol: 1e-6,
-        }
-    }
-
     fn problem_no_trade() -> PredictionMarketProblem {
         // Two outcomes with identical fair_value = 0.5, one UniV3 market at
         // p = 0.5, and an initial holding on "b" so the analytical split
@@ -313,7 +314,6 @@ mod tests {
         let problem = problem_no_trade();
         let opts = SolveOptions {
             mode: Mode::DirectOnly,
-            tolerances: slack_tols(),
             ..Default::default()
         };
         let outcome = solve(&problem, opts).unwrap();
@@ -332,7 +332,6 @@ mod tests {
         let problem = problem_no_trade();
         let opts = SolveOptions {
             mode: Mode::MixedEnabled,
-            tolerances: slack_tols(),
             ..Default::default()
         };
         let outcome = solve(&problem, opts).unwrap();
