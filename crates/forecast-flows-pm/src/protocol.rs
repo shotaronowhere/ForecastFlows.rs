@@ -45,6 +45,18 @@ pub struct HealthResult {
 impl HealthResponse {
     /// Build a v2 health response with the stable `ForecastFlows` capability
     /// list, matching the committed `health_response.json` fixture exactly.
+    ///
+    /// The advertised `supported_market_types` and `public_interfaces`
+    /// intentionally include `constant_product` and
+    /// `PredictionMarketFixedGasModel` even though the v1 Rust port rejects
+    /// those payloads (see `request.rs`). Those capabilities are classified
+    /// as **deferred stable API** in the migration plan §0.2 — they are
+    /// legitimate future scope that the live consumer does not currently
+    /// exercise. The health response is a byte-identical mirror of the
+    /// Julia worker's response envelope, so any divergence here would break
+    /// fixture parity and the subset-JSON harness. Treat this list as a
+    /// "compatibility envelope, not exact support," and read `request.rs`
+    /// for the actual accepted payload surface.
     #[must_use]
     pub fn stable(request_id: Option<String>, package_version: impl Into<String>) -> Self {
         Self {

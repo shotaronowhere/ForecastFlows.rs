@@ -14,6 +14,8 @@
 //! requests bypass the cache, matching Julia's behavior of only entering the
 //! cache branch for `CompareRequest`.
 
+use std::time::Instant;
+
 use serde_json::Value;
 
 use crate::problem::PredictionMarketProblem;
@@ -112,10 +114,17 @@ fn handle_solve(
     opts: SolveOptions,
 ) -> Result<Value, ErrorResponse> {
     let mode = opts.mode;
+    // Julia parity: `PredictionMarketSolveResult.solver_time_sec`
+    // (`prediction_market_api.jl:372`) is the wall-clock of the solve call.
+    // Wrap only the `solve` invocation so DTO/edge construction time doesn't
+    // leak into the number — matches Julia's `total_time += solve!(...)`
+    // accounting at `solver.jl:1029`.
+    let solve_start = Instant::now();
     let outcome = solve(problem, opts).map_err(|e| solve_error(rid.as_ref(), &e))?;
+    let solve_secs = solve_start.elapsed().as_secs_f64();
     let edges = build_edges(problem, mode, Some(outcome.split_bound), 0.0)
         .map_err(|e| solve_error(rid.as_ref(), &SolveError::Problem(e)))?;
-    let result = extract_solve_result(problem, &outcome, mode, &edges, None);
+    let result = extract_solve_result(problem, &outcome, mode, &edges, Some(solve_secs));
     let resp = SolveResponse {
         protocol_version: PROTOCOL_VERSION,
         request_id: rid,
@@ -263,12 +272,18 @@ mod tests {
         assert_eq!(v2["ok"], true);
         assert_eq!(v1["request_id"], "c-1");
         assert_eq!(v2["request_id"], "c-2");
-        // Strip request_id and compare full result payload — the cached
-        // warm-start must not change the trades, EV, or certificate.
+        // Strip request_id and per-call wall-clock `solver_time_sec`, then
+        // compare the full result payload — the cached warm-start must not
+        // change the trades, EV, or certificate.
         let mut v1_stripped = v1.clone();
         let mut v2_stripped = v2.clone();
         v1_stripped["request_id"] = Value::Null;
         v2_stripped["request_id"] = Value::Null;
+        for v in [&mut v1_stripped, &mut v2_stripped] {
+            for mode in ["direct_only", "mixed_enabled"] {
+                v["result"][mode]["solver_time_sec"] = Value::Null;
+            }
+        }
         assert_eq!(
             v1_stripped, v2_stripped,
             "cached compare response must match fresh response bit-for-bit"

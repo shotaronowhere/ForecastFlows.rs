@@ -5,11 +5,13 @@
 //! (`src/prediction_market_api.jl:1302`). The direct-only path is a single
 //! `BoundedDualProblem::solve_and_certify` call with no doubling.
 //!
-//! No warm-start across iterations — each `B` rebuilds the
-//! `BoundedDualProblem` from scratch and the solver re-seeds at
-//! `clamp(c + 100·√eps, …)`. Julia warm-starts from the prior dual iterate
-//! when a workspace is available; that optimization lands with the workspace
-//! port in a later phase.
+//! Warm-start across iterations: each `B` rebuilds the `BoundedDualProblem`
+//! from scratch, but the converged ν from the most recent *certified* inner
+//! solve is promoted as the seed for the next doubling (and for the first
+//! bisection midpoint). Mirrors Julia `prediction_market_api.jl:1398`
+//! (`ν_seed = ν_candidate`) and `:1383` (`ν_bisect = ν_mid`). The seed is
+//! clamped into the new box by `BoundedDualProblem::clamp_seed` before it
+//! reaches the C driver so a ν feasible at `B` stays feasible at `2·B`.
 
 use forecast_flows_core::{
     BoundedDualProblem, CertifyTolerances, DualSolution, Objective, SolveCertificate,
@@ -84,11 +86,13 @@ pub fn solve(
 }
 
 /// `solve` variant that threads a caller-provided dual seed into the
-/// underlying `BoundedDualProblem`. For `Mode::MixedEnabled`, the seed is
-/// reused across the entire doubling loop's inner solves — Julia's
-/// `_solve_prediction_market_mixed` does the same with
-/// `ν_seed = _workspace_seed(workspace, :direct_only)` at line 1322
-/// (mixed reads the *direct* seed, not the mixed seed).
+/// underlying `BoundedDualProblem`. For `Mode::MixedEnabled`, the seed only
+/// seeds the *first* inner solve; subsequent doubling iterations (and the
+/// bisection midpoints) warm-start from the ν of the most recent certified
+/// inner solve. Mirrors Julia `_solve_prediction_market_mixed` at
+/// `prediction_market_api.jl:1322` (`ν_seed = workspace.direct_seed`) →
+/// `:1398` (`ν_seed = ν_candidate` after each certified outer solve) →
+/// `:1383` (`ν_bisect = ν_mid` after each certified bisection midpoint).
 pub fn solve_with_seed(
     problem: &PredictionMarketProblem,
     opts: SolveOptions,
@@ -139,16 +143,30 @@ fn solve_mixed_with_doubling(
     let gap_tol_for_mu = (500.0 * f64::EPSILON.sqrt()).max(500.0 * opts.solver.pgtol);
 
     let mut best: Option<SolveOutcome> = None;
+    // Warm-start seed tracker: starts from the caller-provided seed, gets
+    // promoted to the converged ν after each certified inner solve. Julia
+    // parity: `prediction_market_api.jl:1398`.
+    let mut seed: Option<Vec<f64>> = nu_seed.map(<[f64]>::to_vec);
 
     for doubling in 0..=opts.max_doublings {
         let mu = moreau_yosida_mu(split_bound, gap_tol_for_mu);
-        let outcome = solve_at_bound(problem, &obj, n_nodes, split_bound, mu, opts, nu_seed)?;
+        let outcome = solve_at_bound(
+            problem,
+            &obj,
+            n_nodes,
+            split_bound,
+            mu,
+            opts,
+            seed.as_deref(),
+        )?;
 
         if !outcome.certificate.passed {
             if let Some(prior) = best.take() {
                 // The last certified solve was at split_bound/2. Bisect
                 // between that and the current (failed) split_bound to find
-                // the highest certifiable bound.
+                // the highest certifiable bound. Julia line 1360 enters
+                // bisection with `ν_bisect = ν_seed` — i.e. the most
+                // recently certified ν, which is exactly our `seed`.
                 return bisect(
                     problem,
                     &obj,
@@ -158,10 +176,12 @@ fn solve_mixed_with_doubling(
                     prior,
                     opts,
                     gap_tol_for_mu,
-                    nu_seed,
+                    seed.as_deref(),
                 );
             }
-            // No prior certified result yet — keep doubling.
+            // No prior certified result yet — keep doubling. Leave `seed`
+            // alone: the ν from an uncertified solve is not promoted
+            // (Julia line 1398 only runs on the certified branch).
             let next = (split_bound * 2.0).min(b_max);
             if next <= split_bound {
                 // Already at b_max; a further doubling won't change B and
@@ -177,6 +197,10 @@ fn solve_mixed_with_doubling(
         if realized < 0.8 * split_bound {
             return Ok(outcome);
         }
+        // Promote the converged dual as the seed for the next doubling
+        // iteration (or for bisection, if the next iteration fails).
+        // Mirrors Julia `ν_seed = ν_candidate` at line 1398.
+        seed = Some(outcome.solution.nu.clone());
         best = Some(outcome);
 
         if doubling == opts.max_doublings {
@@ -218,12 +242,18 @@ fn bisect(
     nu_seed: Option<&[f64]>,
 ) -> Result<SolveOutcome, SolveError> {
     let mut best = initial_best;
+    // Julia `prediction_market_api.jl:1360-1361` initializes
+    // `ν_bisect = ν_seed` (= the most recently certified dual before
+    // entering bisection) and updates `ν_bisect = ν_mid` on each certified
+    // midpoint (line 1383). Uncertified midpoints do not promote.
+    let mut seed: Option<Vec<f64>> = nu_seed.map(<[f64]>::to_vec);
     for _ in 0..4 {
         let mid = 0.5 * (lo + hi);
         let mu = moreau_yosida_mu(mid, gap_tol_for_mu);
-        let outcome = solve_at_bound(problem, obj, n_nodes, mid, mu, opts, nu_seed)?;
+        let outcome = solve_at_bound(problem, obj, n_nodes, mid, mu, opts, seed.as_deref())?;
         if outcome.certificate.passed {
             lo = mid;
+            seed = Some(outcome.solution.nu.clone());
             best = outcome;
         } else {
             hi = mid;
@@ -386,5 +416,51 @@ mod tests {
         let problem = problem_no_trade();
         let edges = build_edges(&problem, Mode::MixedEnabled, Some(1.0), 1e-4).unwrap();
         assert_trailing_split_merge(&edges);
+    }
+
+    /// P1 regression: warm-starting a mixed solve from a prior-converged ν
+    /// should not increase L-BFGS-B iterations vs. a cold start. This is the
+    /// load-bearing test for the seed-promotion fix in
+    /// `solve_mixed_with_doubling`: without promotion, every doubling
+    /// iteration restarted from the *initial* seed even after a certified
+    /// inner solve, silently paying extra iterations on the mixed hot path.
+    #[test]
+    fn warm_seed_does_not_increase_iterations_over_cold() {
+        let problem = problem_no_trade();
+        let opts = SolveOptions {
+            mode: Mode::MixedEnabled,
+            ..Default::default()
+        };
+        let cold = solve_with_seed(&problem, opts, None).unwrap();
+        assert!(cold.certificate.passed, "cold solve must certify");
+        let warm = solve_with_seed(&problem, opts, Some(&cold.solution.nu)).unwrap();
+        assert!(warm.certificate.passed, "warm solve must certify");
+        assert!(
+            warm.solution.iterations <= cold.solution.iterations,
+            "warm iterations={} must be ≤ cold iterations={}",
+            warm.solution.iterations,
+            cold.solution.iterations,
+        );
+    }
+
+    /// P1 regression: running the mixed doubling loop with
+    /// `max_doublings > 0` must still certify and produce the same
+    /// near-equilibrium result. Guards against a seed-promotion refactor
+    /// accidentally passing a stale or miss-dimensioned ν into the inner
+    /// `solve_at_bound`.
+    #[test]
+    fn mixed_doubling_loop_still_certifies_with_max_doublings_three() {
+        let problem = problem_no_trade();
+        let opts = SolveOptions {
+            mode: Mode::MixedEnabled,
+            max_doublings: 3,
+            ..Default::default()
+        };
+        let outcome = solve(&problem, opts).unwrap();
+        assert!(
+            outcome.certificate.passed,
+            "certificate failed after 3 doublings: {}",
+            outcome.certificate.reason
+        );
     }
 }

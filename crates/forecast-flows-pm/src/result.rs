@@ -8,6 +8,8 @@
 //! Narrowed v1 scope: no gas model — `estimated_execution_cost` and `net_ev`
 //! are always `None` until the gas-model port lands.
 
+use std::time::Instant;
+
 use forecast_flows_core::{DualSolution, Edge, SolveCertificate};
 
 use crate::problem::{Mode, PredictionMarketProblem};
@@ -197,7 +199,9 @@ pub fn compare_prediction_market_families(
     direct_opts: SolveOptions,
     mixed_opts: SolveOptions,
 ) -> Result<CompareResponse, SolveError> {
+    let direct_start = Instant::now();
     let direct_outcome = solve(problem, direct_opts)?;
+    let direct_secs = direct_start.elapsed().as_secs_f64();
     let direct_edges = crate::problem::build_edges(problem, Mode::DirectOnly, None, 0.0)
         .map_err(SolveError::Problem)?;
     let direct_result = extract_solve_result(
@@ -205,10 +209,12 @@ pub fn compare_prediction_market_families(
         &direct_outcome,
         Mode::DirectOnly,
         &direct_edges,
-        None,
+        Some(direct_secs),
     );
 
+    let mixed_start = Instant::now();
     let mixed_outcome = solve(problem, mixed_opts)?;
+    let mixed_secs = mixed_start.elapsed().as_secs_f64();
     let mixed_edges = crate::problem::build_edges(
         problem,
         Mode::MixedEnabled,
@@ -221,7 +227,7 @@ pub fn compare_prediction_market_families(
         &mixed_outcome,
         Mode::MixedEnabled,
         &mixed_edges,
-        None,
+        Some(mixed_secs),
     );
 
     Ok(CompareResponse {
@@ -252,7 +258,9 @@ pub fn compare_prediction_market_families_with_workspace(
     direct_opts: SolveOptions,
     mixed_opts: SolveOptions,
 ) -> Result<CompareResponse, SolveError> {
+    let direct_start = Instant::now();
     let direct_outcome = solve_with_seed(problem, direct_opts, workspace.direct_seed())?;
+    let direct_secs = direct_start.elapsed().as_secs_f64();
     workspace.store_direct_seed(&direct_outcome.solution.nu);
     let direct_edges = crate::problem::build_edges(problem, Mode::DirectOnly, None, 0.0)
         .map_err(SolveError::Problem)?;
@@ -261,11 +269,13 @@ pub fn compare_prediction_market_families_with_workspace(
         &direct_outcome,
         Mode::DirectOnly,
         &direct_edges,
-        None,
+        Some(direct_secs),
     );
 
     // Julia line 1322: mixed reads `direct_seed`, not `mixed_seed`.
+    let mixed_start = Instant::now();
     let mixed_outcome = solve_with_seed(problem, mixed_opts, workspace.direct_seed())?;
+    let mixed_secs = mixed_start.elapsed().as_secs_f64();
     workspace.store_mixed_seed(&mixed_outcome.solution.nu);
     let mixed_edges = crate::problem::build_edges(
         problem,
@@ -279,7 +289,7 @@ pub fn compare_prediction_market_families_with_workspace(
         &mixed_outcome,
         Mode::MixedEnabled,
         &mixed_edges,
-        None,
+        Some(mixed_secs),
     );
 
     Ok(CompareResponse {
@@ -376,5 +386,36 @@ mod tests {
         assert_eq!(resp.result.mixed_enabled.mode, "mixed_enabled");
         assert_eq!(resp.result.direct_only.status, "certified");
         assert_eq!(resp.result.mixed_enabled.status, "certified");
+    }
+
+    /// P2a regression: deep_trading consumes `solver_time_sec` for per-mode
+    /// latency telemetry (`forecastflows/mod.rs:238-239`,
+    /// `client.rs:1233-1234`). The field was always `None` prior to the
+    /// Instant::now() plumbing; the protocol-parity subset harness missed
+    /// it because the committed fixture doesn't include the field, so
+    /// `assert_json_subset` never asserted on it.
+    #[test]
+    fn compare_emits_finite_nonnegative_solver_time_sec_per_mode() {
+        let problem = problem_no_trade();
+        let direct_opts = SolveOptions {
+            mode: Mode::DirectOnly,
+            ..Default::default()
+        };
+        let mixed_opts = SolveOptions {
+            mode: Mode::MixedEnabled,
+            ..Default::default()
+        };
+        let resp =
+            compare_prediction_market_families(&problem, None, direct_opts, mixed_opts).unwrap();
+        for (label, dto) in [
+            ("direct_only", &resp.result.direct_only),
+            ("mixed_enabled", &resp.result.mixed_enabled),
+        ] {
+            let t = dto
+                .solver_time_sec
+                .unwrap_or_else(|| panic!("{label}.solver_time_sec missing"));
+            assert!(t.is_finite(), "{label}.solver_time_sec={t} not finite");
+            assert!(t >= 0.0, "{label}.solver_time_sec={t} negative");
+        }
     }
 }
