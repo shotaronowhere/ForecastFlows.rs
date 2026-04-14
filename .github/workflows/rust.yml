@@ -1,0 +1,45 @@
+# Enforces the migration-plan Phase 2 gate documented in
+# ../ForecastFlows.jl/docs/2026-04-12-rust-migration-plan.md §2.
+#
+# Jobs are split so fmt/clippy fail fast before the slower release test
+# build, and so a single red job still surfaces the others' logs.
+#
+# `--test-threads=1` is mandatory on the test job: the `lbfgsb` C-port
+# is not reentrant and tests guard a global `LBFGSB_LOCK` mutex, but
+# parallel runs still occasionally flake under the default runner. See
+# the migration plan §12 "2026-04-13 Phase 5 L-BFGS-B C-port swap"
+# entry for the provenance of this constraint.
+
+name: rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (release, serial)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --release -- --test-threads=1
