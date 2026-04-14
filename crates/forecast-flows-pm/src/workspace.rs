@@ -39,8 +39,16 @@ impl Layout {
     /// `_prediction_market_layout`.
     pub fn from_problem(problem: &PredictionMarketProblem) -> Self {
         Self {
-            outcome_ids: problem.outcomes().iter().map(|o| o.outcome_id().to_string()).collect(),
-            market_ids: problem.markets().iter().map(|m| m.market_id().to_string()).collect(),
+            outcome_ids: problem
+                .outcomes()
+                .iter()
+                .map(|o| o.outcome_id().to_string())
+                .collect(),
+            market_ids: problem
+                .markets()
+                .iter()
+                .map(|m| m.market_id().to_string())
+                .collect(),
             market_outcome_ids: problem
                 .markets()
                 .iter()

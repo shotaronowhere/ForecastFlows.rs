@@ -19,6 +19,7 @@ use std::time::Instant;
 use serde_json::Value;
 
 use crate::problem::PredictionMarketProblem;
+use crate::problem::build_edges;
 use crate::protocol::{
     ErrorBody, ErrorResponse, HealthResponse, PROTOCOL_VERSION, SolveResponse, error_codes,
 };
@@ -26,7 +27,6 @@ use crate::request::{ParsedRequest, RequestError, parse_protocol_request};
 use crate::result::{compare_prediction_market_families_with_workspace, extract_solve_result};
 use crate::solve::{SolveError, SolveOptions, solve};
 use crate::workspace::{PredictionMarketWorkspace, worker_compare_workspace};
-use crate::problem::build_edges;
 
 /// Stable package version reported by the worker. Bumped together with the
 /// `forecast-flows-pm` crate version and the Julia `Project.toml` version.

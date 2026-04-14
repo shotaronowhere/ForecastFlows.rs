@@ -41,5 +41,7 @@ pub use result::{
     extract_solve_result,
 };
 pub use solve::{SolveError, SolveOptions, SolveOutcome, solve, solve_with_seed};
-pub use worker::{PACKAGE_VERSION, handle_protocol_json, handle_protocol_json_with_workspace_cache};
+pub use worker::{
+    PACKAGE_VERSION, handle_protocol_json, handle_protocol_json_with_workspace_cache,
+};
 pub use workspace::{Layout, PredictionMarketWorkspace, worker_compare_workspace};
