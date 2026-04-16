@@ -133,6 +133,13 @@ pub struct CompareResponse {
 pub struct CompareResult {
     pub direct_only: SolveResultDto,
     pub mixed_enabled: SolveResultDto,
+    /// `true` iff this compare reused a cached `PredictionMarketWorkspace`
+    /// whose layout matched the request topology. Stateless / stateful-miss
+    /// paths set this to `false`. Consumed by `deep_trading` telemetry to
+    /// distinguish cold vs. warm-start solves; see
+    /// `deep_trading/src/portfolio/core/forecastflows/client.rs`.
+    #[serde(default)]
+    pub workspace_reused: bool,
 }
 
 /// Pure-data solve result mirroring `PredictionMarketSolveResult`.

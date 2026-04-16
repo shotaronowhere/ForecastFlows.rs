@@ -142,6 +142,14 @@ fn handle_compare(
     direct_opts: SolveOptions,
     mixed_opts: SolveOptions,
 ) -> Result<Value, ErrorResponse> {
+    // Snapshot the cache state before `worker_compare_workspace` may rebuild
+    // it. Reuse means: the cache already holds a workspace with a layout that
+    // matches `problem`, so this compare warm-starts from the prior solve's
+    // converged duals. Wire this onto the `CompareResult` so downstream
+    // telemetry (deep_trading) can distinguish cold vs. warm compares.
+    let workspace_reused = workspace
+        .as_ref()
+        .is_some_and(|ws| ws.is_compatible_with(problem));
     let ws = worker_compare_workspace(workspace, problem);
     match compare_prediction_market_families_with_workspace(
         ws,
@@ -149,6 +157,7 @@ fn handle_compare(
         rid.cloned(),
         direct_opts,
         mixed_opts,
+        workspace_reused,
     ) {
         Ok(resp) => Ok(serde_json::to_value(&resp).expect("CompareResponse always serializes")),
         Err(e) => Err(solve_error(rid, &e)),
@@ -272,9 +281,15 @@ mod tests {
         assert_eq!(v2["ok"], true);
         assert_eq!(v1["request_id"], "c-1");
         assert_eq!(v2["request_id"], "c-2");
-        // Strip request_id and per-call wall-clock `solver_time_sec`, then
-        // compare the full result payload — the cached warm-start must not
-        // change the trades, EV, or certificate.
+        // Fresh cache / compatible-reuse distinction is load-bearing telemetry
+        // downstream: the first compare allocates a new workspace (miss), the
+        // second warm-starts from the stored seeds (hit).
+        assert_eq!(v1["result"]["workspace_reused"], Value::Bool(false));
+        assert_eq!(v2["result"]["workspace_reused"], Value::Bool(true));
+        // Strip request_id, per-call wall-clock `solver_time_sec`, and the
+        // `workspace_reused` telemetry flag, then compare the full result
+        // payload — the cached warm-start must not change the trades, EV, or
+        // certificate.
         let mut v1_stripped = v1.clone();
         let mut v2_stripped = v2.clone();
         v1_stripped["request_id"] = Value::Null;
@@ -283,6 +298,7 @@ mod tests {
             for mode in ["direct_only", "mixed_enabled"] {
                 v["result"][mode]["solver_time_sec"] = Value::Null;
             }
+            v["result"]["workspace_reused"] = Value::Null;
         }
         assert_eq!(
             v1_stripped, v2_stripped,

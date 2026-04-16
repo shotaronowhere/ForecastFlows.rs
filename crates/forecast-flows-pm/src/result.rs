@@ -17,7 +17,7 @@ use crate::protocol::{
     CertificateDto, CompareResponse, CompareResult, PROTOCOL_VERSION, SolveResultDto,
     SplitMergePlanDto, TradeDto, finite_or_null, finite_or_null_vec,
 };
-use crate::solve::{SolveError, SolveOptions, SolveOutcome, solve, solve_with_seed};
+use crate::solve::{SolveError, SolveOptions, SolveOutcome, solve_with_seed};
 use crate::workspace::PredictionMarketWorkspace;
 
 /// Tolerance for "edge is active" / non-zero trade reporting. Mirrors Julia's
@@ -187,12 +187,101 @@ pub fn extract_solve_result(
     }
 }
 
+/// Julia parity: when a per-mode solve runs the doubling loop to exhaustion
+/// without finding *any* certifiable `split_bound`, Julia's
+/// `compare_prediction_market_families!` downgrades that mode to an
+/// "uncertified" no-trade result rather than aborting the whole compare.
+/// Mirrors `_mark_prediction_market_uncertified` applied to a null identity
+/// outcome. Holdings round-trip (no trade) and the certificate carries the
+/// "never certified" diagnostic so downstream telemetry can distinguish a
+/// downgrade from a genuine certified-but-near-active result.
+fn uncertified_no_trade_result(
+    problem: &PredictionMarketProblem,
+    mode: Mode,
+    reason: String,
+    solver_time_sec: Option<f64>,
+) -> SolveResultDto {
+    let outcome_ids: Vec<String> = problem
+        .outcomes()
+        .iter()
+        .map(|o| o.outcome_id().to_string())
+        .collect();
+    let initial_holdings: Vec<f64> = problem
+        .outcomes()
+        .iter()
+        .map(crate::problem::OutcomeSpec::initial_holding)
+        .collect();
+    let outcome_values: Vec<f64> = problem
+        .outcomes()
+        .iter()
+        .map(crate::problem::OutcomeSpec::fair_value)
+        .collect();
+    let initial_collateral = problem.collateral_balance();
+    // No-trade identity: final == initial for every balance.
+    let final_collateral = initial_collateral;
+    let final_holdings = initial_holdings.clone();
+    let initial_ev: f64 = initial_collateral
+        + outcome_values
+            .iter()
+            .zip(initial_holdings.iter())
+            .map(|(v, h)| v * h)
+            .sum::<f64>();
+    let final_ev = initial_ev;
+    SolveResultDto {
+        status: "uncertified".to_string(),
+        mode: mode_label(mode).to_string(),
+        certificate: Some(CertificateDto {
+            passed: false,
+            message: reason,
+            primal_value: None,
+            dual_value: None,
+            duality_gap: None,
+            target_residual: None,
+            bound_residual: None,
+        }),
+        solver_time_sec: solver_time_sec.and_then(finite_or_null),
+        initial_ev: finite_or_null(initial_ev),
+        final_ev: finite_or_null(final_ev),
+        ev_gain: finite_or_null(0.0),
+        estimated_execution_cost: None,
+        net_ev: None,
+        outcome_ids,
+        initial_collateral: finite_or_null(initial_collateral),
+        final_collateral: finite_or_null(final_collateral),
+        initial_holdings: finite_or_null_vec(&initial_holdings),
+        final_holdings: finite_or_null_vec(&final_holdings),
+        trades: Vec::new(),
+        split_merge: SplitMergePlanDto {
+            mint: finite_or_null(0.0),
+            merge: finite_or_null(0.0),
+        },
+    }
+}
+
+/// Julia parity: `SolveError::NeverCertified` at the per-mode call-site means
+/// the doubling loop exhausted without any certificate, which Julia downgrades
+/// to an uncertified no-trade `SolveResultDto` rather than aborting the
+/// compare. Other `SolveError` variants (problem-validation, core L-BFGS-B
+/// failure) still bubble as hard errors.
+fn solve_mode_for_compare(
+    problem: &PredictionMarketProblem,
+    opts: SolveOptions,
+    nu_seed: Option<&[f64]>,
+) -> Result<Result<SolveOutcome, String>, SolveError> {
+    match solve_with_seed(problem, opts, nu_seed) {
+        Ok(outcome) => Ok(Ok(outcome)),
+        Err(SolveError::NeverCertified(levels)) => Ok(Err(format!(
+            "mixed solve never certified across {levels} split_bound levels"
+        ))),
+        Err(other) => Err(other),
+    }
+}
+
 /// Run both `direct_only` and `mixed_enabled` solves on `problem` and bundle
 /// the results into a `CompareResponse`. Mirrors Julia
 /// `compare_prediction_market_families!` minus the workspace cache and gas
-/// model. Per-mode `solve` failures bubble up as `SolveError` instead of being
-/// swallowed into an "uncertified" result — the workspace-aware variant in a
-/// later phase will catch and downgrade those.
+/// model. Per-mode `NeverCertified` failures are downgraded to an uncertified
+/// no-trade result so the compare as a whole still succeeds.
 pub fn compare_prediction_market_families(
     problem: &PredictionMarketProblem,
     request_id: Option<String>,
@@ -200,35 +289,49 @@ pub fn compare_prediction_market_families(
     mixed_opts: SolveOptions,
 ) -> Result<CompareResponse, SolveError> {
     let direct_start = Instant::now();
-    let direct_outcome = solve(problem, direct_opts)?;
+    let direct_outcome = solve_mode_for_compare(problem, direct_opts, None)?;
     let direct_secs = direct_start.elapsed().as_secs_f64();
-    let direct_edges = crate::problem::build_edges(problem, Mode::DirectOnly, None, 0.0)
-        .map_err(SolveError::Problem)?;
-    let direct_result = extract_solve_result(
-        problem,
-        &direct_outcome,
-        Mode::DirectOnly,
-        &direct_edges,
-        Some(direct_secs),
-    );
+    let direct_result = match direct_outcome {
+        Ok(outcome) => {
+            let direct_edges = crate::problem::build_edges(problem, Mode::DirectOnly, None, 0.0)
+                .map_err(SolveError::Problem)?;
+            extract_solve_result(
+                problem,
+                &outcome,
+                Mode::DirectOnly,
+                &direct_edges,
+                Some(direct_secs),
+            )
+        }
+        Err(reason) => {
+            uncertified_no_trade_result(problem, Mode::DirectOnly, reason, Some(direct_secs))
+        }
+    };
 
     let mixed_start = Instant::now();
-    let mixed_outcome = solve(problem, mixed_opts)?;
+    let mixed_outcome = solve_mode_for_compare(problem, mixed_opts, None)?;
     let mixed_secs = mixed_start.elapsed().as_secs_f64();
-    let mixed_edges = crate::problem::build_edges(
-        problem,
-        Mode::MixedEnabled,
-        Some(mixed_outcome.split_bound),
-        0.0,
-    )
-    .map_err(SolveError::Problem)?;
-    let mixed_result = extract_solve_result(
-        problem,
-        &mixed_outcome,
-        Mode::MixedEnabled,
-        &mixed_edges,
-        Some(mixed_secs),
-    );
+    let mixed_result = match mixed_outcome {
+        Ok(outcome) => {
+            let mixed_edges = crate::problem::build_edges(
+                problem,
+                Mode::MixedEnabled,
+                Some(outcome.split_bound),
+                0.0,
+            )
+            .map_err(SolveError::Problem)?;
+            extract_solve_result(
+                problem,
+                &outcome,
+                Mode::MixedEnabled,
+                &mixed_edges,
+                Some(mixed_secs),
+            )
+        }
+        Err(reason) => {
+            uncertified_no_trade_result(problem, Mode::MixedEnabled, reason, Some(mixed_secs))
+        }
+    };
 
     Ok(CompareResponse {
         protocol_version: PROTOCOL_VERSION,
@@ -238,6 +341,7 @@ pub fn compare_prediction_market_families(
         result: CompareResult {
             direct_only: direct_result,
             mixed_enabled: mixed_result,
+            workspace_reused: false,
         },
     })
 }
@@ -250,47 +354,68 @@ pub fn compare_prediction_market_families(
 /// back into the matching slot.
 ///
 /// Caller is responsible for ensuring the workspace layout matches `problem` —
-/// the worker uses `worker_compare_workspace` to enforce that.
+/// the worker uses `worker_compare_workspace` to enforce that. The caller also
+/// supplies `workspace_reused`, which is forwarded verbatim onto the returned
+/// `CompareResult` so downstream telemetry can distinguish cold vs. warm-start
+/// solves.
 pub fn compare_prediction_market_families_with_workspace(
     workspace: &mut PredictionMarketWorkspace,
     problem: &PredictionMarketProblem,
     request_id: Option<String>,
     direct_opts: SolveOptions,
     mixed_opts: SolveOptions,
+    workspace_reused: bool,
 ) -> Result<CompareResponse, SolveError> {
     let direct_start = Instant::now();
-    let direct_outcome = solve_with_seed(problem, direct_opts, workspace.direct_seed())?;
+    let direct_outcome = solve_mode_for_compare(problem, direct_opts, workspace.direct_seed())?;
     let direct_secs = direct_start.elapsed().as_secs_f64();
-    workspace.store_direct_seed(&direct_outcome.solution.nu);
-    let direct_edges = crate::problem::build_edges(problem, Mode::DirectOnly, None, 0.0)
-        .map_err(SolveError::Problem)?;
-    let direct_result = extract_solve_result(
-        problem,
-        &direct_outcome,
-        Mode::DirectOnly,
-        &direct_edges,
-        Some(direct_secs),
-    );
+    let direct_result = match direct_outcome {
+        Ok(outcome) => {
+            workspace.store_direct_seed(&outcome.solution.nu);
+            let direct_edges = crate::problem::build_edges(problem, Mode::DirectOnly, None, 0.0)
+                .map_err(SolveError::Problem)?;
+            extract_solve_result(
+                problem,
+                &outcome,
+                Mode::DirectOnly,
+                &direct_edges,
+                Some(direct_secs),
+            )
+        }
+        Err(reason) => {
+            // No certified dual → do not promote a stale seed; Julia
+            // `prediction_market_api.jl:1398` only promotes on certified
+            // inner solves.
+            uncertified_no_trade_result(problem, Mode::DirectOnly, reason, Some(direct_secs))
+        }
+    };
 
     // Julia line 1322: mixed reads `direct_seed`, not `mixed_seed`.
     let mixed_start = Instant::now();
-    let mixed_outcome = solve_with_seed(problem, mixed_opts, workspace.direct_seed())?;
+    let mixed_outcome = solve_mode_for_compare(problem, mixed_opts, workspace.direct_seed())?;
     let mixed_secs = mixed_start.elapsed().as_secs_f64();
-    workspace.store_mixed_seed(&mixed_outcome.solution.nu);
-    let mixed_edges = crate::problem::build_edges(
-        problem,
-        Mode::MixedEnabled,
-        Some(mixed_outcome.split_bound),
-        0.0,
-    )
-    .map_err(SolveError::Problem)?;
-    let mixed_result = extract_solve_result(
-        problem,
-        &mixed_outcome,
-        Mode::MixedEnabled,
-        &mixed_edges,
-        Some(mixed_secs),
-    );
+    let mixed_result = match mixed_outcome {
+        Ok(outcome) => {
+            workspace.store_mixed_seed(&outcome.solution.nu);
+            let mixed_edges = crate::problem::build_edges(
+                problem,
+                Mode::MixedEnabled,
+                Some(outcome.split_bound),
+                0.0,
+            )
+            .map_err(SolveError::Problem)?;
+            extract_solve_result(
+                problem,
+                &outcome,
+                Mode::MixedEnabled,
+                &mixed_edges,
+                Some(mixed_secs),
+            )
+        }
+        Err(reason) => {
+            uncertified_no_trade_result(problem, Mode::MixedEnabled, reason, Some(mixed_secs))
+        }
+    };
 
     Ok(CompareResponse {
         protocol_version: PROTOCOL_VERSION,
@@ -300,6 +425,7 @@ pub fn compare_prediction_market_families_with_workspace(
         result: CompareResult {
             direct_only: direct_result,
             mixed_enabled: mixed_result,
+            workspace_reused,
         },
     })
 }
@@ -308,6 +434,7 @@ pub fn compare_prediction_market_families_with_workspace(
 mod tests {
     use super::*;
     use crate::problem::{OutcomeSpec, UniV3Band, UniV3MarketSpec};
+    use crate::solve::solve;
     fn problem_no_trade() -> PredictionMarketProblem {
         let outcomes = vec![
             OutcomeSpec::new("a", 0.5, 0.0).unwrap(),
@@ -386,6 +513,67 @@ mod tests {
         assert_eq!(resp.result.mixed_enabled.mode, "mixed_enabled");
         assert_eq!(resp.result.direct_only.status, "certified");
         assert_eq!(resp.result.mixed_enabled.status, "certified");
+    }
+
+    /// Downgrade-path regression: when the doubling loop exhausts without any
+    /// certified result (`SolveError::NeverCertified`), Julia parity requires
+    /// returning an uncertified no-trade result for that mode rather than
+    /// failing the whole compare. Prove the helper's shape: holdings round-
+    /// trip, no trades, certificate has `passed=false` with the supplied
+    /// reason, and EV numbers match the no-trade identity.
+    #[test]
+    fn uncertified_no_trade_result_round_trips_identity() {
+        let problem = problem_no_trade();
+        let dto = uncertified_no_trade_result(
+            &problem,
+            Mode::MixedEnabled,
+            "mixed solve never certified across 7 split_bound levels".to_string(),
+            Some(0.0125),
+        );
+        assert_eq!(dto.status, "uncertified");
+        assert_eq!(dto.mode, "mixed_enabled");
+        let cert = dto.certificate.as_ref().expect("certificate populated");
+        assert!(!cert.passed);
+        assert!(cert.message.contains("never certified"));
+        // No trades; holdings round-trip from initial to final.
+        assert!(dto.trades.is_empty(), "no-trade fallback emits no trades");
+        assert_eq!(dto.initial_holdings, vec![Some(0.0), Some(1.0)]);
+        assert_eq!(dto.final_holdings, vec![Some(0.0), Some(1.0)]);
+        assert_eq!(dto.initial_collateral, Some(1.0));
+        assert_eq!(dto.final_collateral, Some(1.0));
+        // initial_ev = 1.0 + 0·0.5 + 1·0.5 = 1.5; ev_gain = 0 (no trade).
+        assert!((dto.initial_ev.unwrap() - 1.5).abs() < 1e-12);
+        assert!((dto.final_ev.unwrap() - 1.5).abs() < 1e-12);
+        assert_eq!(dto.ev_gain, Some(0.0));
+        // split/merge plan is identity-zero.
+        assert_eq!(dto.split_merge.mint, Some(0.0));
+        assert_eq!(dto.split_merge.merge, Some(0.0));
+        // Solver time preserved.
+        assert_eq!(dto.solver_time_sec, Some(0.0125));
+    }
+
+    /// Downgrade-path regression at the compare-orchestrator level: when
+    /// `SolveError::NeverCertified` fires for a branch, we expect the other
+    /// branch to still emit a certified result and the compare to succeed as
+    /// a whole. Uses the Julia-parity helper directly since crafting a
+    /// fixture that genuinely hits `NeverCertified` requires adversarial
+    /// problem data; end-to-end coverage lives in the downstream
+    /// `forecastflows_doctor` fixture run.
+    #[test]
+    fn downgrade_helper_covers_both_modes_symmetrically() {
+        let problem = problem_no_trade();
+        for mode in [Mode::DirectOnly, Mode::MixedEnabled] {
+            let dto =
+                uncertified_no_trade_result(&problem, mode, "forced downgrade".to_string(), None);
+            assert_eq!(dto.status, "uncertified");
+            assert_eq!(dto.mode, mode_label(mode));
+            assert!(dto.trades.is_empty());
+            assert_eq!(
+                dto.initial_holdings, dto.final_holdings,
+                "holdings must round-trip for {mode:?}"
+            );
+            assert_eq!(dto.solver_time_sec, None);
+        }
     }
 
     /// P2a regression: deep_trading consumes `solver_time_sec` for per-mode
