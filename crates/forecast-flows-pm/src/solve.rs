@@ -368,7 +368,8 @@ fn solve_at_bound(
     // — extends naturally here so a B<1 doesn't invert the rescue/primary μ
     // ordering (the rescue must be *gentler* than the primary).
     let rescue_mu = SPLITMERGE_RESCUE_BAND / split_bound.max(1.0);
-    if !(rescue_mu > mu) {
+    // NaN in either operand also returns the baseline, as before.
+    if rescue_mu.partial_cmp(&mu) != Some(std::cmp::Ordering::Greater) {
         // Primary μ is already at least as gentle as the rescue — nothing
         // more to try. Propagate the baseline (uncertified) outcome.
         return Ok(baseline);
@@ -680,7 +681,7 @@ mod tests {
             .expect("split/merge flow present")[0]
             .abs();
         assert!(
-            (sm_flow - 0.687860).abs() < 1e-3,
+            (sm_flow - 0.687_860).abs() < 1e-3,
             "interior mint must match Julia v2.0.0: got {sm_flow}"
         );
     }
