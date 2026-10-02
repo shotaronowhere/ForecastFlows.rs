@@ -2,15 +2,13 @@
 
 Rust port of [`ForecastFlows.jl`](https://github.com/shotaronowhere/ForecastFlows.jl) — an optimal-order router for a prediction market, built on a convex-flow (dual-decomposition) formulation with a custom mint/merge hyperedge.
 
-The Rust worker speaks the same protocol-v2 NDJSON stdio interface as the Julia oracle and is a drop-in replacement behind the [`deep_trading`](https://github.com/shotaronowhere/deep_trading) consumer's `PredictionMarketFacade`.
+The Rust worker speaks the same protocol-v2 NDJSON stdio interface as the Julia oracle and is a drop-in replacement for the Julia worker.
 
 ## Status
 
-Phase 8 complete: workspace-cached NDJSON worker with warm-start dual seeds across compatible compare requests. See the canonical migration plan in the Julia repo:
+Implements the workspace-cached NDJSON worker, with warm-start dual seeds across compatible compare requests.
 
-- [`ForecastFlows.jl/docs/2026-04-12-rust-migration-plan.md`](https://github.com/shotaronowhere/ForecastFlows.jl/blob/main/docs/2026-04-12-rust-migration-plan.md) — live status, phase-by-phase spec, and progress log.
-
-Julia parity is enforced via a subset-JSON fixture harness against committed Julia oracle outputs. Non-parity scope (gas model, `constant_product` markets) is deferred under migration plan §0.2.
+Julia parity is enforced via a subset-JSON fixture harness against committed Julia oracle outputs. The gas model and `constant_product` markets are not yet ported.
 
 ## Crates
 
@@ -28,7 +26,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test  --workspace --release -- --test-threads=1
 ```
 
-`--test-threads=1` is **mandatory**: the `lbfgsb` C-port is not reentrant. Tests take a global `LBFGSB_LOCK` mutex, but parallel runs still occasionally flake under shared runners. CI enforces this.
+`--test-threads=1` is required because the `lbfgsb` C port is not reentrant; CI runs the tests serially.
 
 ## CI
 
@@ -36,4 +34,4 @@ cargo test  --workspace --release -- --test-threads=1
 
 ## License
 
-`Cargo.toml` declares `MIT OR Apache-2.0`. License text files are not yet checked in.
+MIT OR Apache-2.0, as declared in `Cargo.toml`.
