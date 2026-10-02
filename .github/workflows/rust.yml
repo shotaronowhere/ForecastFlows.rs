@@ -56,4 +56,6 @@ jobs:
         with:
           toolchain: "1.93.0"
       - uses: Swatinem/rust-cache@v2
+      # Parity tests read the Julia oracle fixtures from a sibling checkout.
+      - run: git clone --depth 1 https://github.com/shotaronowhere/ForecastFlows.jl ../ForecastFlows.jl
       - run: cargo test --workspace --release -- --test-threads=1
