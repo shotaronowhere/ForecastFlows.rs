@@ -34,4 +34,4 @@ cargo test  --workspace --release -- --test-threads=1
 
 ## License
 
-MIT OR Apache-2.0, as declared in `Cargo.toml`.
+MIT. See [LICENSE](LICENSE).
